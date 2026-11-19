@@ -1,8 +1,7 @@
-"""Helpers shared by raster ingestion: target grid, Zarr writing, catalogue."""
+"""Helpers shared by raster ingestion: target grid, Zarr writing."""
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from dataclasses import dataclass
@@ -14,7 +13,6 @@ import xarray as xr
 from rasterio.transform import Affine, from_origin
 
 from ..config import settings
-from ..db import connect
 from ..zarrio import write_atomic
 
 log = logging.getLogger(__name__)
@@ -52,34 +50,11 @@ class Grid:
         return self.y1 - self.res * (np.arange(self.height) + 0.5)
 
 
-def write_zarr(ds: xr.Dataset, name: str, grid: Grid, source: str, description: str) -> Path:
+def write_zarr(ds: xr.Dataset, name: str, grid: Grid) -> Path:
     ds = ds.rio.write_crs(grid.crs)
     ds = ds.rio.write_transform(grid.transform)
     path = settings.site_zarr_dir / f"{name}.zarr"
     write_atomic(ds, path)
     log.info("Wrote %s (%s)", path, ", ".join(ds.data_vars))
-    register(ds, name, path, grid, source, description)
     return path
 
-
-def register(ds: xr.Dataset, name: str, path: Path, grid: Grid, source: str, description: str,
-             extra: dict | None = None) -> None:
-    """Records a raster dataset in the catalogue (meta.raster_dataset)."""
-    variables = {
-        v: {k: ds[v].attrs.get(k) for k in ("units", "long_name") if k in ds[v].attrs}
-        | {"dims": list(ds[v].dims)}
-        for v in ds.data_vars
-        if v != "spatial_ref"
-    }
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO meta.raster_dataset (name, path, crs, resolution, source, description, attrs, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, now())
-            ON CONFLICT (name) DO UPDATE SET path = EXCLUDED.path, crs = EXCLUDED.crs,
-                resolution = EXCLUDED.resolution, source = EXCLUDED.source,
-                description = EXCLUDED.description, attrs = EXCLUDED.attrs, updated_at = now()
-            """,
-            (name, str(path.relative_to(settings.data_dir)), grid.crs, grid.res, source, description,
-             json.dumps({"variables": variables, "bbox": [grid.x0, grid.y0, grid.x1, grid.y1]} | (extra or {}))),
-        )

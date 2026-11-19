@@ -85,8 +85,6 @@ ERA5 = Spec("era5", "reanalysis-era5-single-levels-timeseries", 0.25, 2.0, (
     "100m_u_component_of_wind", "100m_v_component_of_wind", "total_cloud_cover", "boundary_layer_height",
     "surface_latent_heat_flux", "surface_sensible_heat_flux"))
 
-SPECS = {s.name: s for s in (LAND, ERA5)}
-
 
 # ---------------------------------------------------------------------------
 # Physics: humidity and reference evapotranspiration (FAO-56)

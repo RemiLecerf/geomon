@@ -1,8 +1,9 @@
 -- Geomon database schema: the single definition of every table.
 --
 -- Applied by geomon.migrate (ingestion, scheduler, web API) when the database's schema version
--- is older than migrate.SCHEMA_VERSION. Every statement is idempotent, so the script also
--- upgrades databases created by earlier versions. Bump SCHEMA_VERSION after changing it.
+-- is older than migrate.SCHEMA_VERSION. Every statement is idempotent: a change is made by editing
+-- the definitions below (and adding what an existing database needs, as under "Removed"), then
+-- bumping SCHEMA_VERSION.
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS hstore;   -- used by ogr2ogr for OSM other_tags
@@ -50,13 +51,6 @@ CREATE TABLE IF NOT EXISTS meta.aoi (
     bbox       geometry(Polygon, 4326) NOT NULL,        -- buffered download extent of the site
     updated_at timestamptz NOT NULL DEFAULT now()
 );
--- Databases of the single-site versions
-ALTER TABLE meta.aoi ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'commune';
-ALTER TABLE meta.aoi ADD COLUMN IF NOT EXISTS site text;
-ALTER TABLE meta.aoi ADD COLUMN IF NOT EXISTS members text[];
-ALTER TABLE meta.aoi ADD COLUMN IF NOT EXISTS position int;
-ALTER TABLE meta.aoi DROP CONSTRAINT IF EXISTS aoi_pkey;
-DROP INDEX IF EXISTS meta.aoi_kind_code_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS aoi_site_kind_code_idx ON meta.aoi (site, kind, code);
 
 -- ---------------------------------------------------------------------------
@@ -101,7 +95,6 @@ CREATE TABLE IF NOT EXISTS ref.farm_plot (
     props      jsonb NOT NULL DEFAULT '{}'::jsonb,
     geom       geometry(MultiPolygon, 4326) NOT NULL
 );
-ALTER TABLE ref.farm_plot ADD COLUMN IF NOT EXISTS site text;
 CREATE INDEX IF NOT EXISTS farm_plot_geom_idx ON ref.farm_plot USING gist (geom);
 
 -- ---------------------------------------------------------------------------
@@ -118,7 +111,6 @@ CREATE TABLE IF NOT EXISTS ref.osm_feature (
     snapshot  date,                     -- date of the OSM extract
     geom      geometry(Geometry, 4326) NOT NULL
 );
-ALTER TABLE ref.osm_feature ADD COLUMN IF NOT EXISTS site text;
 CREATE INDEX IF NOT EXISTS osm_feature_geom_idx ON ref.osm_feature USING gist (geom);
 CREATE INDEX IF NOT EXISTS osm_feature_layer_idx ON ref.osm_feature (layer);
 CREATE INDEX IF NOT EXISTS osm_feature_site_layer_idx ON ref.osm_feature (site, layer);
@@ -178,19 +170,8 @@ JOIN ref.admin_unit a
  AND (a.valid_to IS NULL OR make_date(COALESCE(o.geo_vintage, a.vintage), 1, 1) < a.valid_to);
 
 -- ---------------------------------------------------------------------------
--- Catalogue of raster layers stored as Zarr on the host, and the ingestion log
+-- Ingestion log
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS meta.raster_dataset (
-    name        text PRIMARY KEY,         -- dem, soil
-    path        text NOT NULL,            -- path under GEOMON_DATA_DIR
-    crs         text NOT NULL,
-    resolution  double precision NOT NULL,
-    source      text NOT NULL,
-    description text,
-    attrs       jsonb NOT NULL DEFAULT '{}'::jsonb,
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
-
 CREATE TABLE IF NOT EXISTS meta.ingest_log (
     id          bigserial PRIMARY KEY,
     site        text,
@@ -201,7 +182,6 @@ CREATE TABLE IF NOT EXISTS meta.ingest_log (
     message     text,
     details     jsonb NOT NULL DEFAULT '{}'::jsonb
 );
-ALTER TABLE meta.ingest_log ADD COLUMN IF NOT EXISTS site text;
 
 -- ---------------------------------------------------------------------------
 -- Sentinel-2 (the images are Zarr stores under data/zarr/sentinel2/<site>/[<part>/]<year>.zarr)
@@ -257,7 +237,6 @@ CREATE TABLE IF NOT EXISTS eo.parcel_season (
     computed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (site, season, index, parcel_id)
 );
-ALTER TABLE eo.parcel_season ADD COLUMN IF NOT EXISTS n_pixels int;
 
 -- Each parcel of a site, per RPG year: its crop and the areas it lies in (its point on surface),
 -- for the crop-group curves below (version 2)
@@ -294,3 +273,9 @@ CREATE TABLE IF NOT EXISTS eo.group_season (
     computed_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (site, index, area, code_group, season)
 );
+
+-- ---------------------------------------------------------------------------
+-- Removed
+-- ---------------------------------------------------------------------------
+-- version 3: the raster catalogue, written by the ingestion but read by nothing
+DROP TABLE IF EXISTS meta.raster_dataset;

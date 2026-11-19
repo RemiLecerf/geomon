@@ -4,7 +4,7 @@ import pytest
 
 from geomon import weather as w
 from geomon.ingest import agera5, openmeteo
-from geomon.units import convert, is_compatible
+from geomon.units import convert
 
 
 def _hourly(start, hours, **cols):
@@ -66,7 +66,8 @@ def test_units():
     assert convert(15.0, "degC", "K") == pytest.approx(288.15)
     assert convert(3.2, "g/kg", "percent") == pytest.approx(0.32)
     assert convert(1.0, "kg/m**2/s", "mm/day") == pytest.approx(86400.0)
-    assert is_compatible("person", "persons") and not is_compatible("person", "m")
+    with pytest.raises(Exception):
+        convert(1.0, "person", "m")
 
 
 def test_agera5_units():

@@ -368,8 +368,8 @@ def raster_tile(name: str, var: str, z: int, x: int, y: int, depth: int = 0) -> 
 @app.get("/api/raster/{name}/{var}.png")
 def raster_png(name: str, var: str, depth: int = 0) -> Response:
     """The whole variable as one image (large for a 5 m DEM: the map uses the tiles)."""
-    r = _raster(rasters.render, name, var, depth)
-    return Response(r.png, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
+    png = _raster(rasters.render, name, var, depth)
+    return Response(png, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
 
 
 # ---------------------------------------------------------------------------
@@ -617,16 +617,6 @@ def status() -> dict:
     return {"version": __version__, "aoi": settings.site_code, "unit": settings.unit or None,
             "communes": list(settings.communes),
             "ingestion": log}
-
-
-@app.post("/api/reload")
-def reload_rasters() -> dict:
-    from .. import weather as w
-
-    rasters.clear_cache()
-    w.clear_cache()
-    sentinel2.clear_cache()
-    return {"reloaded": True}
 
 
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")

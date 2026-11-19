@@ -215,26 +215,13 @@ def _state_path():
 # The state is shared by the job threads: every change to it, and its serialisation, holds this
 # lock (never during a download or a trigger check, which work on a copy).
 _state_lock = threading.RLock()
-_TRIGGER_KEYS = ("checked", "marker", "pending_marker", "last_ok", "last_run")
 
 
 def load_state() -> dict:
-    """The state, converted from the formats of earlier versions (one site; one thread per site)."""
     p = _state_path()
-    raw = json.loads(p.read_text()) if p.exists() else {}
-    if "jobs" in raw or "sites" in raw:
-        raw.setdefault("jobs", {})
-        raw.setdefault("sites", {})
-        return raw
-    names = {j.name for j in JOBS}
-    by_site = {all_sites()[0].code: raw} if any(k in names for k in raw) else raw
-    state = {"jobs": {}, "sites": {}}
-    for code, jobs in by_site.items():
-        state["sites"][code] = {n: {k: v for k, v in st.items() if k != "pending_marker"}
-                                for n, st in jobs.items() if isinstance(st, dict)}
-        for n, st in jobs.items():                 # trigger state: from the first site that has one
-            if isinstance(st, dict) and n not in state["jobs"]:
-                state["jobs"][n] = {k: st[k] for k in _TRIGGER_KEYS if k in st and k != "pending_marker"}
+    state = json.loads(p.read_text()) if p.exists() else {}
+    state.setdefault("jobs", {})
+    state.setdefault("sites", {})
     return state
 
 

@@ -128,11 +128,6 @@ def _finest(name: str, fits) -> Level:
     return next((lv for lv in ls if fits(lv)), ls[-1])
 
 
-def clear_cache() -> None:
-    for f in (_open_dataset, _level_info, _style, _render, _tile, _zonal):
-        f.cache_clear()
-
-
 def catalogue() -> list[dict]:
     out = []
     for name in DATASETS:
@@ -271,19 +266,7 @@ def _warp(arr: np.ndarray, src_transform, var: str, dst: np.ndarray, dst_transfo
     return dst
 
 
-@dataclass
-class Rendered:
-    png: bytes
-    coordinates: list[list[float]]   # TL, TR, BR, BL in lon/lat
-    vmin: float | None
-    vmax: float | None
-    units: str
-    long_name: str
-    colormap: str
-    legend: list[dict]
-
-
-def render(name: str, var: str, depth: int = 0) -> Rendered:
+def render(name: str, var: str, depth: int = 0) -> bytes:
     """The whole variable as one image (``…/{var}.png``; the map uses the tiles), from the finest
     level at most MAX_IMAGE_PX wide and high."""
     return _render(settings.site_code, name, var, depth, _stamp(name))
@@ -300,15 +283,14 @@ def _corners(dst_transform, dw: int, dh: int) -> list[list[float]]:
 
 
 @lru_cache(maxsize=16)
-def _render(site: str, name: str, var: str, depth: int, stamp: float | None) -> Rendered:
+def _render(site: str, name: str, var: str, depth: int, stamp: float | None) -> bytes:
     lv = _finest(name, lambda lv: max(lv.width, lv.height) <= MAX_IMAGE_PX)
     arr, src_transform = _window(name, lv, var, depth, lv.bounds)
     style = _style(site, name, var, stamp)
     dst_transform, dw, dh = _mercator_extent(lv)
     dst = _warp(arr, src_transform, var, np.full((dh, dw), np.nan, dtype="float32"), dst_transform,
                 _resampling(var == "texture_usda", lv.res, lv.res))
-    return Rendered(_png(dst, style, var), _corners(dst_transform, dw, dh), style.vmin, style.vmax,
-                    style.units, style.long_name, style.colormap, style.legend)
+    return _png(dst, style, var)
 
 
 # ---------------------------------------------------------------------------

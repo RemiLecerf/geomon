@@ -174,7 +174,7 @@ def run(aoi: AOI) -> dict:
         attrs={"source": "ISRIC SoilGrids 2.0 (mean predictions), https://soilgrids.org",
                "aoi": aoi.code, "nd_layers": nd},
     )
-    write_zarr(ds, "soil", grid, ds.attrs["source"], "Soil properties by layer, 0-200 cm")
+    write_zarr(ds, "soil", grid)
     return {
         "shape": [nd, grid.height, grid.width],
         "res_m": grid.res,

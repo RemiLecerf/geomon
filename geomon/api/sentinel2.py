@@ -87,8 +87,15 @@ def series(index: str = "ndvi", area: str | None = None, min_clear: float = 0.9)
                         "n_clear": r["n_clear"]} for r in rows]}
 
 
-@lru_cache(maxsize=48)
 def _render(site: str, date: str, index: str, masked: bool, part: str = "") -> tuple[bytes, list, float, float, str]:
+    """An index image of one date and part (cached until its year's store changes)."""
+    z = s2.store_path(site, int(date[:4]), part) / "zarr.json"
+    return _render_cached(site, date, index, masked, part, z.stat().st_mtime if z.exists() else None)
+
+
+@lru_cache(maxsize=48)
+def _render_cached(site: str, date: str, index: str, masked: bool, part: str,
+                   stamp: float | None) -> tuple[bytes, list, float, float, str]:
     try:
         ds = s2.scene(site, date, part)
     except KeyError as exc:
@@ -369,9 +376,3 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
             mean = np.nanmean(np.stack(list(own.values())), axis=0)
         out["own"] = {"seasons": sorted(own), "mean": pc.nan_list(mean)}
     return out
-
-
-def clear_cache() -> None:
-    _render.cache_clear()
-    s2.clear_cache()
-    pc.clear_cache()

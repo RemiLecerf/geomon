@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from pathlib import Path
 
 from ..aoi import AOI
 from ..config import settings
@@ -187,6 +186,3 @@ def run(aoi: AOI) -> dict:
         log.info("INSEE %s: %d observations", ds, n)
     return summary
 
-
-def cache_dir() -> Path:
-    return settings.raw_dir / "insee"

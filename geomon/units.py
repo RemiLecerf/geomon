@@ -77,10 +77,3 @@ def convert(value: Any, from_unit: str, to_unit: str) -> Any:
     m = out.magnitude
     return float(m) if np.ndim(m) == 0 else m
 
-
-def is_compatible(from_unit: str, to_unit: str) -> bool:
-    try:
-        convert(1.0, from_unit, to_unit)
-        return True
-    except Exception:
-        return False

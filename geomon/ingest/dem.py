@@ -25,7 +25,7 @@ from ..arrays import quiet
 from ..config import settings
 from ..http import IGN_WMS_R, session
 from ..zarrio import staged
-from .rasters import Grid, register
+from .rasters import Grid
 
 log = logging.getLogger(__name__)
 
@@ -166,8 +166,6 @@ def run(aoi: AOI) -> dict:
             log.info("DEM: rows %d-%d of %d (%d tile(s) so far)", r0, r1, h, tiles)
     log.info("DEM: %d tile(s), %d x %d px at %.0f m, overviews x%s", tiles, w, h, grid.res,
              ", x".join(map(str, OVERVIEWS)))
-    register(_template(grid, 1, attrs), "dem", stores[1], grid, source, "Elevation, slope and aspect",
-             {"overviews": list(OVERVIEWS)})
     return {
         "shape": [h, w],
         "res_m": grid.res,

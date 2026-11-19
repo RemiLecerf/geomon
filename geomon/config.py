@@ -46,7 +46,7 @@ class Settings:
     # Area of interest: one or more INSEE commune codes, comma-separated (Montseveroux = 38259).
     # Data is downloaded once for their joint extent; each commune and the group can be analysed.
     communes_env: tuple[str, ...] = field(default_factory=lambda: tuple(
-        c.strip() for c in _env("GEOMON_COMMUNES", _env("GEOMON_COMMUNE", "38259")).split(",") if c.strip()))
+        c.strip() for c in _env("GEOMON_COMMUNES", "38259").split(",") if c.strip()))
     # Code and name of the group (used in file names and the web page). Default: the commune code
     # for a single commune, otherwise derived from the codes.
     site_code_env: str = field(default_factory=lambda: _env("GEOMON_SITE_CODE", ""))

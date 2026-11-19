@@ -444,7 +444,7 @@ const WX_GROUPS = [
   ["Wind, clouds and boundary layer", /^(wind|gust|cloud|blh)/],
   ["Snow", /^(snow_depth|swe)/], ["Soil", /^(soil_|swi|wg_)/],
 ];
-const wx = { catalogue: null, lngLat: null, isCentre: true, seq: 0 };
+const wx = { catalogue: null, lngLat: null, seq: 0 };
 // Swatch of a series: its colour, dashed like its line when it has a dash
 const swatchBg = (s) => (s.dash ? `repeating-linear-gradient(90deg,${s.color} 0 4px,transparent 4px 6px)` : s.color);
 

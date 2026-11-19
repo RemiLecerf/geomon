@@ -543,10 +543,6 @@ def compute_groups(site: str, seasons=None) -> int:
     return n
 
 
-def clear_cache() -> None:
-    clear_labels()
-
-
 def _curve(b: bytes | None) -> np.ndarray:
     return np.frombuffer(b, dtype="<f4").astype("float64") if b is not None else np.full(SEASON_DAYS, np.nan)
 

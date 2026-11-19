@@ -96,22 +96,6 @@ class AOI:
     def regions(self) -> list[str]:
         return self._distinct("region")
 
-    # Single-value accessors kept for code that only needs the reference commune's parents
-    @property
-    def epci(self) -> str | None:
-        return self.communes[0].epci
-
-    @property
-    def arrondissement(self) -> str | None:
-        return self.communes[0].arrondissement
-
-    @property
-    def departement(self) -> str:
-        return self.communes[0].departement
-
-    @property
-    def region(self) -> str:
-        return self.communes[0].region
 
 
 def _snap(bounds: tuple[float, float, float, float], step: float) -> tuple[float, float, float, float]:

@@ -238,10 +238,3 @@ def forecast(lon: float | None = None, lat: float | None = None, area: str | Non
         "days": [{"date": idx.strftime("%Y-%m-%d"), **{c: _clean([row[c]])[0] for c in d.columns}}
                  for idx, row in d.iterrows()],
     }
-
-
-@router.post("/reload")
-def reload() -> dict:
-    w.clear_cache()
-    return {"reloaded": True}
-

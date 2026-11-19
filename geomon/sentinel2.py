@@ -146,17 +146,6 @@ def clear_cache() -> None:
     _open.cache_clear()
 
 
-def scenes(site: str, date: str) -> list[tuple[str, xr.Dataset]]:
-    """One date in every part that has it: [(part, dataset loaded)]."""
-    out = []
-    for p in parts(site):
-        try:
-            out.append((p, scene(site, date, p)))
-        except KeyError:
-            pass
-    return out
-
-
 def scene(site: str, date: str, part: str = "") -> xr.Dataset:
     """One date (all bands) of one part, loaded."""
     d = dt.date.fromisoformat(date[:10])
@@ -262,12 +251,6 @@ def area_zones(ds: xr.Dataset, areas: dict[str, dict], partition: set[str] = fro
     for c, m in area_masks(ds, {c: g for c, g in areas.items() if c not in partition}).items():
         zones[c] = np.flatnonzero(m.ravel()).astype("int32")
     return zones
-
-
-def area_stats(ds_date: xr.Dataset, masks: dict[str, np.ndarray], indices: list[str]) -> list[dict]:
-    """Statistics of each index over each area for one (loaded) date (areas as boolean images)."""
-    zones = {c: np.flatnonzero(m.ravel()).astype("int32") for c, m in masks.items()}
-    return area_stats_parts([(ds_date, zones)], {c: int(z.size) for c, z in zones.items()}, indices)
 
 
 def area_stats_parts(pieces: list[tuple[xr.Dataset, dict[str, np.ndarray]]], n_area: dict[str, int],

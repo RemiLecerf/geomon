@@ -1,13 +1,11 @@
-"""Database schema: created and upgraded from ``schema.sql``, by the ingestion, the scheduler
-and the web API.
+"""Database schema: created and kept up to date from ``schema.sql``.
 
-The database records the version of the schema it holds (a comment on the ``meta`` schema).
-The script runs only when that version is older than ``SCHEMA_VERSION``: schema changes take
-exclusive locks, so they are not repeated at every start. Bump ``SCHEMA_VERSION`` after
-changing ``schema.sql``.
-
-Several sites in one database: the tables written per site carry a ``site`` column. Rows
-written before (one site per database) are given the site of the database's existing AOI.
+``db/init`` only creates the extensions, when the PostgreSQL cluster is first started: the
+tables come from here, run by the ingestion, the scheduler and the web API when they start. The
+database records the version of the schema it holds (a comment on the ``meta`` schema), and the
+script only runs when that version is older than ``SCHEMA_VERSION``: schema changes take
+exclusive locks, so they are not repeated at every start. Bump ``SCHEMA_VERSION`` after changing
+``schema.sql``.
 """
 
 from __future__ import annotations
@@ -16,14 +14,9 @@ from pathlib import Path
 
 from .db import connect
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 _MARK = "geomon schema "
-
-_BACKFILL = """
-UPDATE {table} SET site = (SELECT code FROM meta.aoi WHERE kind = 'site' ORDER BY updated_at LIMIT 1)
-WHERE site IS NULL
-"""
 
 _done = False
 
@@ -46,7 +39,5 @@ def migrate(force: bool = False) -> None:
             return
         conn.execute("SET lock_timeout = '10s'")
         conn.execute(_SCHEMA_SQL.read_text(encoding="utf-8"))
-        for table in ("ref.osm_feature", "meta.ingest_log", "ref.farm_plot"):
-            conn.execute(_BACKFILL.format(table=table))
         conn.execute(f"COMMENT ON SCHEMA meta IS '{_MARK}{SCHEMA_VERSION}'")
     _done = True
