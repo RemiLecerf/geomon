@@ -1,0 +1,14 @@
+[
+  {
+    "code": "beaune-1",
+    "name": "Beaune",
+    "communes": ["21054"]
+  },
+  {
+    "code": "chartres-3",
+    "name": "Chartres et voisines",
+    "communes": ["28085", "28218", "28229"],
+    "farm_file": "farm/chartres-3/plots.geojson",
+    "farm_name": "My plots"
+  }
+]

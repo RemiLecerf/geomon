@@ -56,7 +56,8 @@ def run(aoi: AOI) -> dict:
             conn.execute("DELETE FROM meta.aoi WHERE site = %s AND kind = 'farm'", (aoi.code,))
         return {"skipped": "no farm file for this site"}
     if not path.exists():
-        raise FileNotFoundError(f"GEOMON_FARM_FILE: {path} not found")
+        raise FileNotFoundError(f"Farm plots file {path} not found (farm_file in sites.json, or GEOMON_FARM_FILE); "
+                                "add the file or remove the setting")
     data = json.loads(path.read_text(encoding="utf-8"))
     feats = [f for f in data.get("features", []) if f.get("geometry")]
     if not feats:

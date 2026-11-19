@@ -179,7 +179,10 @@ docker compose run --rm ingest sentinel2-parcels
 ### Sites
 
 One server can follow several sites (groups of communes), for example Montseveroux in Isère and
-Dragey-Ronthon in the Manche. List them in `data/sites.json`; the first one is shown by default:
+Dragey-Ronthon in the Manche. List them in `data/sites.json` (start from `sites.example.json`:
+`cp sites.example.json data/sites.json`, then edit it); the first one is shown by default. Each site has
+a `code` (letters, digits and dashes: it names its folders), a `name`, its `communes` (INSEE codes) and,
+optionally, a `farm_file` and `farm_name` (see "The farm's plots"; leave them out without a plots file):
 
 ```json
 [
