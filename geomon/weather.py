@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import math
 from dataclasses import dataclass
 from functools import lru_cache
@@ -29,6 +30,8 @@ import pandas as pd
 import xarray as xr
 
 from .config import settings
+
+log = logging.getLogger(__name__)
 
 LOCAL_TZ = "Europe/Paris"
 
@@ -51,7 +54,12 @@ PRODUCTS: dict[str, Product] = {
         Product("om_forecast", "Forecast: Météo-France AROME/ARPEGE, then ECMWF IFS",
                 "Open-Meteo Forecast API, models meteofrance_seamless and ecmwf_ifs", "hour", "1.5–9 km",
                 forecast=True),
-        Product("om_era5land", "ERA5-Land reanalysis (ERA5 for rain, wind, radiation, ET0)",
+        Product("era5land", "ERA5-Land reanalysis (hourly, 0.1°)",
+                "Copernicus CDS reanalysis-era5-land-timeseries (ECMWF)", "hour", "0.1° (~9 km)"),
+        Product("era5", "ERA5 reanalysis (hourly, 0.25°)",
+                "Copernicus CDS reanalysis-era5-single-levels-timeseries (ECMWF)", "hour", "0.25° (~28 km)"),
+        # Former source of ERA5-Land, kept as an option (GEOMON_ERA5_SOURCE=openmeteo)
+        Product("om_era5land", "ERA5-Land via Open-Meteo (ERA5 for rain, wind, radiation, ET0)",
                 "Open-Meteo Historical Weather API, models era5_land then era5 (Copernicus ECMWF)", "hour",
                 "0.1° (~9 km); ERA5 0.25°"),
         Product("agera5", "AgERA5 agrometeorological indicators (ERA5, daily, 0.1°)",
@@ -62,9 +70,13 @@ PRODUCTS: dict[str, Product] = {
 }
 
 # Display series: one history product, optionally continued by a forecast product
+_OPENMETEO_ERA5 = settings.era5_source == "openmeteo"
 SERIES = {
     "mf": {"label": "Météo-France AROME/ARPEGE + forecast", "history": "om_mf_hist", "forecast": "om_forecast"},
-    "era5land": {"label": "ERA5-Land / ERA5 (reanalysis)", "history": "om_era5land", "forecast": None},
+    "era5land": {"label": "ERA5-Land / ERA5 via Open-Meteo (reanalysis)" if _OPENMETEO_ERA5
+                 else "ERA5-Land (reanalysis, 0.1°)",
+                 "history": "om_era5land" if _OPENMETEO_ERA5 else "era5land", "forecast": None},
+    "era5": {"label": "ERA5 (reanalysis, 0.25°)", "history": "era5", "forecast": None},
     "agera5": {"label": "AgERA5 (Copernicus)", "history": "agera5", "forecast": None},
     "sim2": {"label": "SIM2 / SAFRAN (reanalysis)", "history": "sim2", "forecast": None},
 }
@@ -74,24 +86,77 @@ def store_path(name: str) -> Path:
     return settings.site_zarr_dir / "weather" / f"{name}.zarr"
 
 
+def _hourly_history(name: str) -> bool:
+    """An hourly archive (not a forecast): read lazily, with a daily store beside it."""
+    p = PRODUCTS.get(name)
+    return p is not None and p.step == "hour" and not p.forecast
+
+
+def daily_name(name: str) -> str:
+    """The daily store of an hourly archive (local days, every daily variable, every point)."""
+    return f"{name}_daily"
+
+
 @lru_cache(maxsize=16)
-def _open_cached(path: str, mtime: float) -> xr.Dataset:
-    return xr.open_zarr(path, consolidated=True).load()
+def _open_cached(path: str, mtime: float, load: bool) -> xr.Dataset:
+    ds = xr.open_zarr(path, consolidated=True)
+    return ds.load() if load else ds
+
+
+def _mtime(name: str) -> float | None:
+    z = store_path(name) / "zarr.json"
+    return z.stat().st_mtime if z.exists() else None
 
 
 def open_product(name: str) -> xr.Dataset | None:
-    path = store_path(name)
-    zmeta = path / "zarr.json"
-    if not zmeta.exists():
+    """A product of the current site. Hourly archives are opened lazily (a département's hourly
+    store does not fit in memory: the daily values come from :func:`open_daily`); daily products
+    and forecasts are loaded."""
+    mtime = _mtime(name)
+    if mtime is None:
         return None
-    return _open_cached(str(path), zmeta.stat().st_mtime)
+    return _open_cached(str(store_path(name)), mtime, not _hourly_history(name))
+
+
+def open_daily(name: str) -> xr.Dataset | None:
+    """Daily values of a product, loaded: the product itself when daily; for an hourly archive its
+    daily store, or the daily values computed from the hourly store when that is missing or older
+    (an archive written before daily stores existed)."""
+    if not _hourly_history(name):
+        return open_product(name)
+    hourly, daily = _mtime(name), _mtime(daily_name(name))
+    if hourly is None:
+        return None
+    if daily is not None and daily >= hourly:
+        return _open_cached(str(store_path(daily_name(name))), daily, True)
+    return _daily_fallback(str(store_path(name)), hourly)
+
+
+@lru_cache(maxsize=4)
+def _daily_fallback(path: str, mtime: float) -> xr.Dataset:
+    log.warning("No daily store for %s: daily values computed from the hourly store", path)
+    with xr.open_zarr(path, consolidated=True) as ds:
+        return daily_dataset(ds.load())
 
 
 def clear_cache() -> None:
-    _open_cached.cache_clear()
-    _series_point.cache_clear()
-    _series_area.cache_clear()
-    _area_weights.cache_clear()
+    for f in (_open_cached, _daily_fallback, _series_point, _series_area, _area_weights):
+        f.cache_clear()
+
+
+def write_product(ds: xr.Dataset, name: str) -> None:
+    """Replaces the store of a product of the current site (atomically: the web API may be reading
+    it); for an hourly archive, its daily store too."""
+    from .zarrio import write_atomic
+
+    write_atomic(ds, store_path(name))
+    log.info("Wrote %s: %d points, %s to %s, %d variables", name, ds.sizes["point"],
+             str(ds.time.values[0])[:16], str(ds.time.values[-1])[:16], len(ds.data_vars))
+    if _hourly_history(name):
+        daily = daily_dataset(ds)
+        write_atomic(daily, store_path(daily_name(name)))
+        log.info("Wrote %s: %d days, %d variables", daily_name(name), daily.sizes["time"], len(daily.data_vars))
+    clear_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +195,7 @@ DAILY_VARS: list[DailyVar] = [
     DailyVar("snowfall_we", "Snowfall (water equivalent)", "mm", "sum"),
     DailyVar("radiation", "Global solar radiation", "MJ/m**2", "sum", "Solar-Radiation-Flux"),
     DailyVar("longwave_down", "Downward long-wave radiation", "MJ/m**2", "sum"),
+    DailyVar("sensible_heat", "Sensible heat flux from the surface (ERA5)", "MJ/m**2", "sum"),
     DailyVar("et0", "Reference evapotranspiration (FAO-56 Penman-Monteith)", "mm", "sum", "Reference-Evapotranspiration"),
     DailyVar("rh_mean", "Relative humidity 2 m, daily mean", "percent", "mean"),
     DailyVar("rh_06", "Relative humidity 2 m at 06 h local time", "percent", "mean", "Relative-Humidity-2m-06h"),
@@ -145,7 +211,10 @@ DAILY_VARS: list[DailyVar] = [
              "Vapour-Pressure-Deficit-at-Maximum-Temperature"),
     DailyVar("q_mean", "Specific humidity, daily mean", "g/kg", "mean"),
     DailyVar("wind_mean", "Wind speed 10 m, daily mean", "m/s", "mean", "Wind-Speed-10m-Mean"),
+    DailyVar("wind_mean_100m", "Wind speed 100 m, daily mean (ERA5)", "m/s", "mean"),
+    DailyVar("gust_max", "Wind gust 10 m, daily maximum (ERA5)", "m/s", "mean"),
     DailyVar("cloud_cover", "Cloud cover, daily mean", "percent", "mean", "Cloud-Cover-Mean"),
+    DailyVar("blh_max", "Boundary-layer height, daily maximum (ERA5)", "m", "mean"),
     DailyVar("snow_depth", "Snow depth, daily mean", "m", "mean", "Snow-Thickness-Mean"),
     DailyVar("swe", "Snow water equivalent, daily mean", "mm", "mean"),
     DailyVar("soil_t_0_7", "Soil temperature 0–7 cm", "degC", "mean"),
@@ -158,7 +227,7 @@ DAILY_VARS: list[DailyVar] = [
     DailyVar("soil_m_100_255", "Soil moisture 100–255 cm", "m**3/m**3", "mean"),
     DailyVar("swi", "Soil wetness index (SIM2)", "dimensionless", "mean"),
     DailyVar("wg_root", "Liquid water content of the root zone at 06 UTC (SIM2)", "m**3/m**3", "mean"),
-    DailyVar("evap", "Actual evapotranspiration (SIM2)", "mm", "sum"),
+    DailyVar("evap", "Actual evapotranspiration (SIM2; ERA5 from the latent heat flux)", "mm", "sum"),
     DailyVar("drainage", "Drainage (SIM2)", "mm", "sum"),
     DailyVar("runoff", "Runoff (SIM2)", "mm", "sum"),
     DailyVar("effective_rain", "Effective rainfall (SIM2)", "mm", "sum"),
@@ -173,7 +242,11 @@ _HOURLY_RULES: list[tuple[str, str, str]] = [
     ("precipitation", "precip", "sum"),
     ("rain", "rain", "sum"),
     ("snowfall", "snowfall", "sum"),
+    ("snowfall_water_equivalent", "snowfall_we", "sum"),
     ("shortwave_radiation", "radiation", "energy"),
+    ("longwave_radiation", "longwave_down", "energy"),
+    ("sensible_heat_flux", "sensible_heat", "energy"),
+    ("evapotranspiration", "evap", "sum"),
     ("et0_fao_evapotranspiration", "et0", "sum"),
     ("relative_humidity_2m", "rh_mean", "mean"),
     ("relative_humidity_2m", "rh_06", "h06"),
@@ -184,7 +257,10 @@ _HOURLY_RULES: list[tuple[str, str, str]] = [
     ("dew_point_2m", "vp_mean", "vapour_pressure"),
     ("vapour_pressure_deficit", "vpd_mean", "mean"),
     ("wind_speed_10m", "wind_mean", "mean"),
+    ("wind_speed_100m", "wind_mean_100m", "mean"),
+    ("wind_gusts_10m", "gust_max", "max"),
     ("cloud_cover", "cloud_cover", "mean"),
+    ("boundary_layer_height", "blh_max", "max"),
     ("snow_depth", "snow_depth", "mean"),
     ("soil_temperature_0_to_7cm", "soil_t_0_7", "mean"),
     ("soil_temperature_7_to_28cm", "soil_t_7_28", "mean"),
@@ -250,6 +326,47 @@ def hourly_to_daily(frame: pd.DataFrame, variables: list[str] | None = None) -> 
     return df
 
 
+def daily_matrix(times: np.ndarray, data: dict[str, np.ndarray]) -> tuple[pd.DatetimeIndex, dict[str, np.ndarray]]:
+    """:func:`hourly_to_daily` for every point at once: ``data`` holds (time, point) arrays of the
+    hourly variables (UTC times); returns the local days and the (day, point) daily arrays."""
+    local = _local_index(times)
+    codes, days = pd.factorize(local.tz_localize(None).normalize(), sort=True)
+    hour = np.asarray(local.hour)
+    out: dict[str, np.ndarray] = {}
+    for src, dst, how in _HOURLY_RULES:
+        if src not in data:
+            continue
+        a = np.asarray(data[src], dtype="float64")
+        g = pd.DataFrame(a).groupby(codes)
+        n = g.count()
+        if how in ("mean", "min", "max"):
+            v = getattr(g, how)()
+        elif how == "sum":
+            v = g.sum(min_count=1)
+        elif how == "energy":
+            v = g.sum(min_count=1) * 3600 / 1e6
+        elif how == "vapour_pressure":
+            v = pd.DataFrame(6.112 * np.exp(17.67 * a / (a + 243.5))).groupby(codes).mean()
+        elif how.startswith("h"):
+            sel = np.where((hour == int(how[1:]))[:, None], a, np.nan)
+            out[dst] = pd.DataFrame(sel).groupby(codes).mean().to_numpy()
+            continue
+        else:
+            raise ValueError(how)
+        out[dst] = v.where(n >= MIN_HOURS).to_numpy()
+    return pd.DatetimeIndex(days), out
+
+
+def daily_dataset(ds: xr.Dataset) -> xr.Dataset:
+    """The daily store of an hourly product: every daily variable it provides, at every point."""
+    data = {v: ds[v].values for v in ds.data_vars if ds[v].dims == ("time", "point")}
+    days, out = daily_matrix(ds["time"].values, data)
+    coords = {k: c for k, c in ds.coords.items() if k != "time"}
+    return xr.Dataset({k: (("time", "point"), a, {"units": DAILY[k].units}) for k, a in out.items()},
+                      coords={"time": days.values, **coords},
+                      attrs=dict(ds.attrs) | {"daily": f"local days ({LOCAL_TZ}) of the hourly product"})
+
+
 def point_frame(name: str, point: int) -> pd.DataFrame:
     """All variables of one point of a product as a table indexed by time (UTC or date)."""
     ds = open_product(name)
@@ -287,23 +404,34 @@ def _point_series(series: str, name: str, i: int, dist: float, variables: list[s
         frame = point_frame(name, i)
         daily = frame[[v for v in variables if v in frame]]
     else:
-        # Archive (when downloaded), continued by the latest forecast
-        hist = open_product(spec["history"])
-        if hist is None:
-            frame = pd.DataFrame()
-        else:
-            h = i if name == spec["history"] else nearest_point(hist, info["point"]["lon"], info["point"]["lat"])[0]
-            frame = point_frame(spec["history"], h)
+        # Archive (its daily store, when downloaded), continued by the latest forecast
+        hist_name = spec["history"]
+        hist = open_product(hist_name)
+        daily, h = pd.DataFrame(index=pd.DatetimeIndex([])), None
+        if hist is not None:
+            h = i if name == hist_name else nearest_point(hist, info["point"]["lon"], info["point"]["lat"])[0]
+            dd = open_daily(hist_name).isel(point=h)
+            daily = pd.DataFrame({v: dd[v].values for v in variables if v in dd.data_vars},
+                                 index=pd.DatetimeIndex(dd["time"].values))
         fc_name = spec["forecast"]
         fc = open_product(fc_name) if fc_name else None
         if fc is not None:
             j, _ = nearest_point(fc, info["point"]["lon"], info["point"]["lat"])
             ff = point_frame(fc_name, j)
             start = ff.index.min()
-            frame = pd.concat([frame[frame.index < start], ff]) if len(frame) else ff
-            info["forecast_from"] = str(_local_index(np.array([start.to_datetime64()]))[0].date())
+            first_day = _local_index(np.array([start.to_datetime64()]))[0].date()
+            # From the forecast's first local day: that day's archive hours before the forecast, then the forecast
+            hours = ff
+            if hist is not None:
+                day0 = pd.Timestamp(first_day).tz_localize(LOCAL_TZ).tz_convert("UTC").tz_localize(None)
+                seg = hist.isel(point=h).sel(time=slice(day0, start - pd.Timedelta(1, "ns"))).load()
+                if seg.sizes["time"]:
+                    before = pd.DataFrame({v: seg[v].values for v in seg.data_vars if seg[v].dims == ("time",)},
+                                          index=pd.DatetimeIndex(seg["time"].values))
+                    hours = pd.concat([before, ff])
+            daily = pd.concat([daily[daily.index < pd.Timestamp(first_day)], hourly_to_daily(hours, variables)])
+            info["forecast_from"] = str(first_day)
             info["forecast_run"] = fc.attrs.get("run")
-        daily = hourly_to_daily(frame, variables)
     info["table"] = daily.dropna(how="all")
     return info
 
@@ -327,7 +455,13 @@ def _transformers():
 
 def cell_step(name: str) -> float | None:
     """Cell size in degrees of the lat/lon products (None for SIM2, on its own grid)."""
-    return {"om_era5land": 0.1, "agera5": 0.1, "sim2": None}.get(name, settings.weather_grid_deg)
+    fixed = {"om_era5land": 0.1, "era5land": 0.1, "era5": 0.25, "agera5": 0.1, "sim2": None}
+    if name in fixed:
+        return fixed[name]
+    # Météo-France products: the step the site's points were requested on (coarser for a large site)
+    ds = open_product(name)
+    step = ds.attrs.get("grid_step") if ds is not None else None
+    return float(step) if step else settings.weather_grid_deg
 
 
 def cell_polygons(name: str) -> list:
@@ -420,7 +554,7 @@ def series_daily_area(series: str, geom_wgs84: dict, variables: list[str]) -> di
     (the result is shared: do not modify it).
     """
     spec = SERIES[series]
-    stamp = _stamp(spec["history"], spec["forecast"])
+    stamp = _stamp(spec["history"], spec["forecast"], daily_name(spec["history"]))
     return _series_area(series, json.dumps(geom_wgs84, sort_keys=True), tuple(variables), stamp, settings.site_code)
 
 
@@ -446,7 +580,7 @@ def _series_area(series: str, geom_json: str, variables: tuple[str, ...], stamp:
                           for t, _ in parts])
         ok = np.isfinite(vals)
         den = (ok * w).sum(axis=0)
-        if den.max() > 0:
+        if den.size and den.max() > 0:              # empty: the product does not provide the variable
             with np.errstate(invalid="ignore", divide="ignore"):
                 out[v] = np.where(den >= 0.5, np.nansum(vals * w, axis=0) / den, np.nan)
     table = pd.DataFrame(out, index=pd.DatetimeIndex(index)).dropna(how="all")

@@ -124,12 +124,44 @@ def _snap(bounds: tuple[float, float, float, float], step: float) -> tuple[float
     )
 
 
+_UNIT_LAYERS = {"DEP": ("departement", "code_insee"), "REG": ("region", "code_insee"),
+                "ARR": ("arrondissement", "code_insee"), "EPCI": ("epci", "code_siren")}
+
+
+def _unit_communes(unit: str) -> tuple[list[dict], str]:
+    """Every commune of an administrative unit (sorted by INSEE code), and the unit's name."""
+    from .config import UNIT_LEVELS
+
+    level, _, code = unit.partition(":")
+    if not code.isalnum():
+        raise ValueError(f"Bad unit code {code!r}")
+    attr = UNIT_LEVELS[level]
+    # A commune may belong to several EPCI ("200068856/200071835"): match the code within the list
+    cql = f"{attr} LIKE '%{code}%'" if level == "EPCI" else f"{attr}='{code}'"
+    feats = wfs_features(f"ADMINEXPRESS-COG.{settings.cog_vintage}:commune", cql=cql)
+    if level == "EPCI":
+        feats = [f for f in feats if code in (f["properties"].get(attr) or "").split("/")]
+    if not feats:
+        raise RuntimeError(f"No commune in {unit} ({settings.cog_vintage} geography)")
+    layer, key = _UNIT_LAYERS[level]
+    unit_feats = wfs_features(f"ADMINEXPRESS-COG.{settings.cog_vintage}:{layer}", cql=f"{key}='{code}'")
+    name = unit_feats[0]["properties"]["nom_officiel"] if unit_feats else unit
+    return sorted(feats, key=lambda f: f["properties"]["code_insee"]), name
+
+
 def resolve_aoi(codes: list[str] | tuple[str, ...] | None = None, buffer_m: float | None = None) -> AOI:
-    codes = list(codes or settings.communes)
+    """The current site's AOI: its communes (or every commune of its administrative unit)."""
     buffer_m = settings.aoi_buffer_m if buffer_m is None else buffer_m
     layer = f"ADMINEXPRESS-COG.{settings.cog_vintage}:commune"
-    quoted = ",".join(f"'{c}'" for c in codes)
-    feats = {f["properties"]["code_insee"]: f for f in wfs_features(layer, cql=f"code_insee IN ({quoted})")}
+    unit_name = None
+    if codes is None and settings.unit:
+        feats_list, unit_name = _unit_communes(settings.unit)
+        feats = {f["properties"]["code_insee"]: f for f in feats_list}
+        codes = list(feats)
+    else:
+        codes = list(codes or settings.communes)
+        quoted = ",".join(f"'{c}'" for c in codes)
+        feats = {f["properties"]["code_insee"]: f for f in wfs_features(layer, cql=f"code_insee IN ({quoted})")}
     missing = [c for c in codes if c not in feats]
     if missing:
         raise RuntimeError(f"Commune(s) {', '.join(missing)} not found in {layer}")
@@ -143,7 +175,7 @@ def resolve_aoi(codes: list[str] | tuple[str, ...] | None = None, buffer_m: floa
     bbox_l93 = _snap(l93.buffer(buffer_m).bounds, settings.soil_res_m)
     bbox_wgs84 = transform(_to_wgs, box(*bbox_l93)).bounds
     code = settings.site_code           # the commune code for a single commune of the environment
-    name = settings.site_name or ", ".join(c.name for c in communes)
+    name = settings.site_name or unit_name or ", ".join(c.name for c in communes)
     aoi = AOI(code=code, name=name, communes=communes, geom_wgs84=mapping(union),
               bbox_l93=bbox_l93, bbox_wgs84=bbox_wgs84, props=communes[0].props)
     log.info("AOI %s %s (%d commune%s), bbox L93 %s", aoi.code, aoi.name, len(communes),

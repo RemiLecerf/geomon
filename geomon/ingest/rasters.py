@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from rasterio.transform import Affine, from_origin
 
 from ..config import settings
 from ..db import connect
+from ..zarrio import write_atomic
 
 log = logging.getLogger(__name__)
 
@@ -56,12 +56,15 @@ def write_zarr(ds: xr.Dataset, name: str, grid: Grid, source: str, description: 
     ds = ds.rio.write_crs(grid.crs)
     ds = ds.rio.write_transform(grid.transform)
     path = settings.site_zarr_dir / f"{name}.zarr"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        shutil.rmtree(path)
-    ds.to_zarr(path, mode="w", consolidated=True)
+    write_atomic(ds, path)
     log.info("Wrote %s (%s)", path, ", ".join(ds.data_vars))
+    register(ds, name, path, grid, source, description)
+    return path
 
+
+def register(ds: xr.Dataset, name: str, path: Path, grid: Grid, source: str, description: str,
+             extra: dict | None = None) -> None:
+    """Records a raster dataset in the catalogue (meta.raster_dataset)."""
     variables = {
         v: {k: ds[v].attrs.get(k) for k in ("units", "long_name") if k in ds[v].attrs}
         | {"dims": list(ds[v].dims)}
@@ -78,6 +81,5 @@ def write_zarr(ds: xr.Dataset, name: str, grid: Grid, source: str, description: 
                 description = EXCLUDED.description, attrs = EXCLUDED.attrs, updated_at = now()
             """,
             (name, str(path.relative_to(settings.data_dir)), grid.crs, grid.res, source, description,
-             json.dumps({"variables": variables, "bbox": [grid.x0, grid.y0, grid.x1, grid.y1]})),
+             json.dumps({"variables": variables, "bbox": [grid.x0, grid.y0, grid.x1, grid.y1]} | (extra or {}))),
         )
-    return path

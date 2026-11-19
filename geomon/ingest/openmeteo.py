@@ -39,7 +39,7 @@ import json
 import logging
 import math
 import re
-import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -52,7 +52,7 @@ from shapely.geometry import box, shape
 from ..aoi import AOI
 from ..config import settings
 from ..http import session
-from ..weather import PRODUCTS, clear_cache, store_path
+from ..weather import PRODUCTS, store_path, write_product
 from . import RetryLater
 
 log = logging.getLogger(__name__)
@@ -110,22 +110,26 @@ def _base(kind: str) -> str:
 
 
 class _Pacer:
-    """Keeps the weighted call count under a per-minute budget."""
+    """Keeps the weighted call count under a per-minute budget (shared by the scheduler's
+    forecast and history threads)."""
 
     def __init__(self, per_minute: float):
         self.per_minute = per_minute
         self.calls: collections.deque[tuple[float, float]] = collections.deque()
+        self.lock = threading.Lock()
 
     def wait(self, weight: float) -> None:
         while True:
-            now = time.monotonic()
-            while self.calls and now - self.calls[0][0] > 60:
-                self.calls.popleft()
-            used = sum(w for _, w in self.calls)
-            if used + weight <= self.per_minute or not self.calls:
-                self.calls.append((now, weight))
-                return
-            time.sleep(max(1.0, 60 - (now - self.calls[0][0])))
+            with self.lock:
+                now = time.monotonic()
+                while self.calls and now - self.calls[0][0] > 60:
+                    self.calls.popleft()
+                used = sum(w for _, w in self.calls)
+                if used + weight <= self.per_minute or not self.calls:
+                    self.calls.append((now, weight))
+                    return
+                pause = max(1.0, 60 - (now - self.calls[0][0]))
+            time.sleep(pause)
 
 
 _pacer = _Pacer(settings.openmeteo_calls_per_minute)
@@ -205,19 +209,40 @@ def _parse(resp: dict, variables: list[str], models: list[str] | None = None) ->
 
 def _fetch(kind: str, points: list[tuple[float, float]], variables: list[str], extra: dict,
            start: dt.date | None = None, end: dt.date | None = None) -> list[dict]:
-    """One request for all points (Open-Meteo accepts lists of coordinates). Returns one block per point."""
-    params = {"latitude": ",".join(f"{p[1]:.4f}" for p in points),
-              "longitude": ",".join(f"{p[0]:.4f}" for p in points),
-              "hourly": ",".join(variables), "timezone": "GMT", "timeformat": "unixtime",
-              "wind_speed_unit": "ms", "cell_selection": "nearest", **extra}
+    """All points, in requests of GEOMON_OPENMETEO_BATCH_POINTS (Open-Meteo accepts lists of
+    coordinates, sent in the URL). Returns one block per point, in order."""
+    base = {"hourly": ",".join(variables), "timezone": "GMT", "timeformat": "unixtime",
+            "wind_speed_unit": "ms", "cell_selection": "nearest", **extra}
     n_models = len(str(extra.get("models", "")).split(","))
     if start is None:
         days = int(extra.get("forecast_days", 7))
     else:
-        params |= {"start_date": start.isoformat(), "end_date": end.isoformat()}
+        base |= {"start_date": start.isoformat(), "end_date": end.isoformat()}
         days = (end - start).days + 1
-    resp = _get(kind, params, _weight(len(variables) * n_models, days, len(points)))
-    return resp if isinstance(resp, list) else [resp]
+    size = max(1, settings.openmeteo_batch_points)
+    out: list[dict] = []
+    for k in range(0, len(points), size):
+        batch = points[k:k + size]
+        params = base | {"latitude": ",".join(f"{p[1]:.4f}" for p in batch),
+                         "longitude": ",".join(f"{p[0]:.4f}" for p in batch)}
+        resp = _get(kind, params, _weight(len(variables) * n_models, days, len(batch)))
+        out += resp if isinstance(resp, list) else [resp]
+    return out
+
+
+def weather_grid(aoi: AOI) -> tuple[float, list[tuple[float, float]]]:
+    """Step and points of the Météo-France grid of a site: GEOMON_WEATHER_GRID_DEG (the AROME 2.5 km
+    grid), doubled until the site has at most GEOMON_WEATHER_MAX_POINTS points (a département would
+    exceed Open-Meteo's free daily quota at 2.5 km; coarser, the points sample the model's cells)."""
+    step = settings.weather_grid_deg
+    points = grid_points(aoi, step)
+    while len(points) > settings.weather_max_points:
+        step *= 2
+        points = grid_points(aoi, step)
+    if step != settings.weather_grid_deg:
+        log.info("Météo-France grid: %g° (%d points; %g° would exceed GEOMON_WEATHER_MAX_POINTS=%d)",
+                 step, len(points), settings.weather_grid_deg, settings.weather_max_points)
+    return step, points
 
 
 def _months(start: dt.date, end: dt.date, months: int):
@@ -266,33 +291,6 @@ def _to_dataset(frames: list[pd.DataFrame], meta: list[dict], points: list[tuple
         },
     )
     return ds
-
-
-def _write(ds: xr.Dataset, name: str) -> None:
-    path = store_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.zarr")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    ds.to_zarr(tmp, mode="w", consolidated=True)
-    # Swap in the new store. On Windows bind mounts a directory rename can fail
-    # for a moment after the old one is removed: retry, then fall back to a copy.
-    for attempt in range(5):
-        try:
-            if path.exists():
-                shutil.rmtree(path)
-            tmp.rename(path)
-            break
-        except OSError as exc:
-            log.debug("Swap of %s failed (%s), retrying", path.name, exc)
-            time.sleep(1 + attempt)
-    else:
-        shutil.rmtree(path, ignore_errors=True)
-        shutil.copytree(tmp, path)
-        shutil.rmtree(tmp, ignore_errors=True)
-    clear_cache()
-    log.info("Wrote %s: %d points, %s to %s, %d variables", path.name, ds.sizes["point"],
-             str(ds.time.values[0])[:16], str(ds.time.values[-1])[:16], len(ds.data_vars))
 
 
 def _reuse(stored: dict, signature: dict) -> list[dict] | None:
@@ -395,7 +393,7 @@ def _revision_due(cache: Path, every_days: int, today: dt.date) -> bool:
 
 def _history(aoi: AOI, name: str, kind: str, points: list[tuple[float, float]], variables: list[str],
              extra: dict, start: dt.date, end: dt.date, months: int,
-             revision_days: int = 0, revision_every_days: int = 7) -> dict:
+             revision_days: int = 0, revision_every_days: int = 7, grid_step: float | None = None) -> dict:
     """Fetch a history in chunks of ``months``, all points per request, and update its store.
 
     Chunks are kept under data/raw/openmeteo/<name>/<aoi> (compressed JSON), named by
@@ -461,7 +459,8 @@ def _history(aoi: AOI, name: str, kind: str, points: list[tuple[float, float]], 
         (cache / "revised.json").write_text(json.dumps({"date": today.isoformat(), "days": overlap}))
 
     if not blocks:
-        store.close()
+        if store is not None:
+            store.close()
         log.info("%s unchanged (up to %s)", name, str(store_end)[:16])
         return {"points": len(points), "start": start.isoformat(), "end": end.isoformat(),
                 "chunks": len(chunks), "fetched_chunks": 0, "unchanged": True}
@@ -490,11 +489,12 @@ def _history(aoi: AOI, name: str, kind: str, points: list[tuple[float, float]], 
             ds = _combine(kept, ds)
     ds.attrs = {
         "product": name, "source": PRODUCTS[name].source, "aoi": aoi.code, "variables": variables,
+        "grid_step": grid_step,
         "start": start.isoformat(), "end": end.isoformat(), "signature": sig_id,
         "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "time_zone": "UTC", "license": "Open-Meteo data: CC BY 4.0",
     }
-    _write(ds, name)
+    write_product(ds, name)
     return {"points": len(points), "start": start.isoformat(), "end": end.isoformat(),
             "chunks": len(chunks), "fetched_chunks": fetched, "parsed_chunks": parsed, "hours": int(ds.sizes["time"])}
 
@@ -503,22 +503,26 @@ def run_history(aoi: AOI) -> dict:
     today = dt.datetime.now(dt.timezone.utc).date()
     start = settings.weather_start
     out = {}
+    step, mf_points = weather_grid(aoi)
     out["om_mf_hist"] = _history(
-        aoi, "om_mf_hist", "historical", grid_points(aoi, settings.weather_grid_deg), MF_VARS,
+        aoi, "om_mf_hist", "historical", mf_points, MF_VARS,
         {"models": "meteofrance_seamless"}, max(start, MF_ARCHIVE_START), today - dt.timedelta(days=1),
-        months=1)   # this archive answers slowly: one month for all points takes 1-3 min
+        months=1, grid_step=step)   # this archive answers slowly: one month for all points takes 1-3 min
+    if settings.era5_source != "openmeteo":       # ERA5-Land and ERA5 come from the CDS (steps era5land, era5)
+        return out
     # ERA5-Land is published with a ~5-day delay
     out["om_era5land"] = _history(
         aoi, "om_era5land", "archive", grid_points(aoi, 0.1), ERA5LAND_VARS,
         {"models": "era5_land,era5"}, start, today - dt.timedelta(days=6), months=12,
-        revision_days=settings.era5_revision_days, revision_every_days=settings.era5_revision_every_days)
+        revision_days=settings.era5_revision_days, revision_every_days=settings.era5_revision_every_days,
+        grid_step=0.1)
     return out
 
 
 def run_forecast(aoi: AOI) -> dict:
     """Latest forecast: Météo-France first, ECMWF IFS beyond its horizon."""
     models = ["meteofrance_seamless", "ecmwf_ifs"]
-    points = grid_points(aoi, settings.weather_grid_deg)
+    step, points = weather_grid(aoi)
     run = dt.datetime.now(dt.timezone.utc)
     raw = _fetch("forecast", points, FORECAST_VARS, {"models": ",".join(models), "forecast_days": 16})
     frames, metas, unit_meta = [], [], []
@@ -537,12 +541,12 @@ def run_forecast(aoi: AOI) -> dict:
             mf_end = max(mf_end or 0, int(t[~np.isnan(v)][-1]))
     mf_until = pd.to_datetime(mf_end, unit="s").isoformat() if mf_end else None
     ds.attrs = {
-        "product": "om_forecast", "source": PRODUCTS["om_forecast"].source, "aoi": aoi.code,
+        "product": "om_forecast", "source": PRODUCTS["om_forecast"].source, "aoi": aoi.code, "grid_step": step,
         "run": run.isoformat(timespec="minutes"), "updated": run.isoformat(timespec="seconds"),
         "models": json.dumps({"meteofrance_seamless": f"until {mf_until}", "ecmwf_ifs": "after, and soil/snow"}),
         "time_zone": "UTC", "license": "Open-Meteo data: CC BY 4.0",
     }
-    _write(ds, "om_forecast")
+    write_product(ds, "om_forecast")
     # Keep every forecast run as a small raw archive, for later verification (Specifications §1)
     arch = settings.raw_dir / "openmeteo" / "forecast" / f"{aoi.code}_{run:%Y%m%dT%H%M}Z.json.gz"
     arch.parent.mkdir(parents=True, exist_ok=True)

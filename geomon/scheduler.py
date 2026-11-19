@@ -8,9 +8,11 @@ Each source is fetched when it publishes, not more often:
 | Job       | Step(s)  | Published                                     | Checked                  |
 |-----------|----------|-----------------------------------------------|--------------------------|
 | forecast  | forecast | AROME every 3 h, ARPEGE and ECMWF every 6 h   | every 15 min (run times) |
-| history   | weather  | Météo-France archive and ERA5: daily          | daily, 02:00 UTC         |
+| history   | weather  | Météo-France archive: daily                   | daily, 02:00 UTC         |
 | sim2      | sim2     | Météo-France "latest" file: daily             | every 6 h                |
 | agera5    | agera5   | Copernicus CDS: daily, ~10 days behind        | every 6 h                |
+| era5land  | era5land | Copernicus CDS: daily, ~10 days behind        | every 6 h                |
+| era5      | era5     | Copernicus CDS: daily, ~10 days behind        | every 6 h                |
 | sentinel2 | sentinel2| L2A scenes, ~5 h after acquisition           | every 3 h (STAC catalogue)|
 
 The forecast job reads Open-Meteo's model metadata (a few hundred bytes per
@@ -18,7 +20,7 @@ model) and only downloads a forecast when one of the models has a new run.
 The sentinel2 job searches the Copernicus Data Space STAC catalogue (no openEO
 credits) and only runs openEO when a new scene below the cloud threshold covers
 the AOI.
-The sim2 and agera5 steps themselves skip the download when nothing changed.
+The sim2, agera5, era5land and era5 steps themselves skip the download when nothing changed.
 
 One scheduler serves every site of sites.json: each dataset (job) has one
 trigger, checked once for all sites (one look at the forecast models' metadata,
@@ -131,8 +133,45 @@ def new_forecast_run(st: dict, now: dt.datetime) -> bool:
     return last is None or marker is None or marker != st.get("marker")
 
 
+STAC_ITEMS = "https://stac.dataspace.copernicus.eu/v1/collections/sentinel-2-l2a/items"
+
+
+def _clear_enough(feature: dict) -> bool:
+    return (feature["properties"].get("eo:cloud_cover") or 0) <= settings.s2_max_cloud
+
+
+def newest_scene(bbox: str, since: str) -> str | None:
+    """Acquisition time of the newest L2A scene over ``bbox`` since ``since`` whose tile cloud cover
+    is at most GEOMON_S2_MAX_CLOUD.
+
+    The catalogue sorts and filters: one item is transferred. A server without the sort or filter
+    extensions (HTTP 4xx) is paged through instead, every item read."""
+    params = {"bbox": bbox, "datetime": f"{since}/.."}
+    r = session().get(STAC_ITEMS, timeout=60, params=params | {
+        "limit": 1, "sortby": "-properties.datetime",
+        "filter": f"eo:cloud_cover<={settings.s2_max_cloud:g}", "filter-lang": "cql2-text"})
+    if r.status_code < 400:
+        feats = [f for f in r.json().get("features", []) if _clear_enough(f)]
+        return feats[0]["properties"]["datetime"] if feats else None
+    if r.status_code >= 500:
+        r.raise_for_status()
+    log.debug("STAC search without sort/filter (%s): paging through the items", r.status_code)
+    times: list[str] = []
+    url, query = STAC_ITEMS, params | {"limit": 100}
+    for _ in range(50):                    # at most 5,000 items
+        r = session().get(url, params=query, timeout=60)
+        r.raise_for_status()
+        page = r.json()
+        times += [f["properties"]["datetime"] for f in page.get("features", []) if _clear_enough(f)]
+        url = next((link["href"] for link in page.get("links", []) if link.get("rel") == "next"), None)
+        if not url:
+            break
+        query = None                       # the next link carries the query
+    return max(times) if times else None
+
+
 def latest_s2_scene() -> str | None:
-    """Acquisition time of the newest L2A scene over the AOI below the cloud threshold (STAC search)."""
+    """Acquisition time of the newest L2A scene over the current site below the cloud threshold."""
     from .db import connect
 
     with connect() as conn:
@@ -141,16 +180,7 @@ def latest_s2_scene() -> str | None:
     if not row:
         return None
     since = (_now() - dt.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    r = session().get(
-        "https://stac.dataspace.copernicus.eu/v1/collections/sentinel-2-l2a/items",
-        params={"bbox": f"{row['x0']},{row['y0']},{row['x1']},{row['y1']}", "datetime": f"{since}/..",
-                "limit": 100},
-        timeout=60,
-    )
-    r.raise_for_status()
-    times = [f["properties"]["datetime"] for f in r.json().get("features", [])
-             if (f["properties"].get("eo:cloud_cover") or 0) <= settings.s2_max_cloud]
-    return max(times) if times else None
+    return newest_scene(f"{row['x0']},{row['y0']},{row['x1']},{row['y1']}", since)
 
 
 def new_s2_scene(st: dict, now: dt.datetime) -> bool:
@@ -164,9 +194,12 @@ def new_s2_scene(st: dict, now: dt.datetime) -> bool:
 JOBS = [
     Job("forecast", ["forecast"], "new AROME/ARPEGE/ECMWF run (checked every 15 min)",
         new_forecast_run, dt.timedelta(minutes=15)),
-    Job("history", ["weather"], "Météo-France archive and ERA5, daily at 02:00 UTC", daily(2, 0)),
+    Job("history", ["weather"], "Météo-France archive, daily at 02:00 UTC", daily(2, 0)),
     Job("sim2", ["sim2"], "SIM2 latest file, every 6 h", every(dt.timedelta(hours=6))),
     Job("agera5", ["agera5"], "AgERA5, every 6 h", every(dt.timedelta(hours=6))),
+    # The steps only send a CDS request when a new day is published
+    Job("era5land", ["era5land"], "ERA5-Land (CDS), every 6 h", every(dt.timedelta(hours=6))),
+    Job("era5", ["era5"], "ERA5 (CDS), every 6 h", every(dt.timedelta(hours=6))),
     Job("sentinel2", ["sentinel2"], "new Sentinel-2 scene (STAC catalogue checked every 3 h for each site)",
         new_s2_scene, dt.timedelta(hours=3), per_site=True),
 ]
@@ -179,7 +212,9 @@ def _state_path():
     return settings.data_dir / "state" / "scheduler.json"
 
 
-_state_lock = threading.Lock()
+# The state is shared by the job threads: every change to it, and its serialisation, holds this
+# lock (never during a download or a trigger check, which work on a copy).
+_state_lock = threading.RLock()
 _TRIGGER_KEYS = ("checked", "marker", "pending_marker", "last_ok", "last_run")
 
 
@@ -205,19 +240,24 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     with _state_lock:
+        text = json.dumps(state, indent=1)
         p = _state_path()
+        if p.exists() and p.read_text() == text:
+            return                 # unchanged: most ticks of most jobs
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(f".{threading.get_ident()}.tmp")
-        for _ in range(10):        # another job's thread may be changing its part: retry
-            try:
-                text = json.dumps(state, indent=1)
-                break
-            except RuntimeError:
-                time.sleep(0.05)
-        else:
-            return
         tmp.write_text(text)
         tmp.replace(p)
+
+
+def _check(job: "Job", st: dict, now: dt.datetime) -> bool:
+    """A job's trigger, evaluated on a copy of its state (it may read the network), merged back."""
+    with _state_lock:
+        work = dict(st)
+    due = job.due(work, now)
+    with _state_lock:
+        st.update(work)
+    return due
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +302,8 @@ def _run_site(job: Job, code: str, sst: dict) -> bool:
     """Runs a job's steps for one site; records the outcome in its site state."""
     with use_site(code):
         now = _now()
-        sst["last_run"] = _iso(now)
+        with _state_lock:
+            sst["last_run"] = _iso(now)
         retry_at = None
         try:
             aoi = _aoi(code)
@@ -275,40 +316,43 @@ def _run_site(job: Job, code: str, sst: dict) -> bool:
         except Exception as exc:
             log.error("%s %s: %s", code, job.name, exc)
             ok = False
-    if ok:
-        sst["last_ok"] = _iso(_now())
-        sst.pop("retry_at", None)
-        sst.pop("error", None)
-    else:
-        sst["retry_at"] = _iso(max(retry_at, _now() + RETRY) if retry_at else _now() + RETRY)
-        sst["error"] = _iso(_now())
-        log.warning("Job %s failed for %s: retry at %s", job.name, code, sst["retry_at"])
+    with _state_lock:
+        if ok:
+            sst["last_ok"] = _iso(_now())
+            sst.pop("retry_at", None)
+            sst.pop("error", None)
+        else:
+            sst["retry_at"] = _iso(max(retry_at, _now() + RETRY) if retry_at else _now() + RETRY)
+            sst["error"] = _iso(_now())
+            log.warning("Job %s failed for %s: retry at %s", job.name, code, sst["retry_at"])
     return ok
 
 
 def run_job(job: Job, state: dict) -> None:
     """Checks a job's trigger once and updates the sites that need it."""
-    js = state["jobs"].setdefault(job.name, {})
     now = _now()
     sites = [s.code for s in all_sites()]
-    site_states = {c: state["sites"].setdefault(c, {}).setdefault(job.name, {}) for c in sites}
+    with _state_lock:
+        js = state["jobs"].setdefault(job.name, {})
+        site_states = {c: state["sites"].setdefault(c, {}).setdefault(job.name, {}) for c in sites}
 
     # Sites to update: all when the trigger fires; else new sites, and failed ones whose retry time came
     todo: list[str] = []
     checked = _parse(js.get("checked"))
     if not checked or now - checked >= job.check_every:
-        js["checked"] = _iso(now)
+        with _state_lock:
+            js["checked"] = _iso(now)
         if job.per_site:
             for c in sites:
                 with use_site(c):
                     try:
-                        if job.due(site_states[c], now):
+                        if _check(job, site_states[c], now):
                             todo.append(c)
                     except Exception as exc:
                         log.warning("%s %s: could not check (%s)", c, job.name, exc)
         else:
             try:
-                if job.due(js, now):
+                if _check(job, js, now):
                     todo = list(sites)
             except Exception as exc:
                 log.warning("%s: could not check (%s)", job.name, exc)
@@ -318,25 +362,27 @@ def run_job(job: Job, state: dict) -> None:
         if c not in todo and ((retry and now >= retry) or (not sst.get("last_ok") and not retry)):
             todo.append(c)
     if not todo:
-        js.pop("pending_marker", None)
+        with _state_lock:
+            js.pop("pending_marker", None)
         save_state(state)
         return
 
     log.info("Job %s: %s · %s", job.name, job.describe, ", ".join(todo))
-    results = {}
     for c in todo:
         if _stop:
             return
-        results[c] = _run_site(job, c, site_states[c])
-        if job.per_site and results[c] and "pending_marker" in site_states[c]:
-            site_states[c]["marker"] = site_states[c].pop("pending_marker")
+        ok = _run_site(job, c, site_states[c])
+        with _state_lock:
+            if job.per_site and ok and "pending_marker" in site_states[c]:
+                site_states[c]["marker"] = site_states[c].pop("pending_marker")
         save_state(state)
     if not job.per_site and set(todo) == set(sites):
         # The trigger moves on after a full run; a site that failed is retried alone (retry_at)
-        js["last_run"] = _iso(now)
-        js["last_ok"] = _iso(_now())
-        if "pending_marker" in js:
-            js["marker"] = js.pop("pending_marker")
+        with _state_lock:
+            js["last_run"] = _iso(now)
+            js["last_ok"] = _iso(_now())
+            if "pending_marker" in js:
+                js["marker"] = js.pop("pending_marker")
     save_state(state)
 
 

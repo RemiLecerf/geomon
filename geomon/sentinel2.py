@@ -207,53 +207,95 @@ def index_array(ds: xr.Dataset, name: str, masked: bool = True) -> np.ndarray:
     return out
 
 
-def area_masks(ds: xr.Dataset, areas: dict[str, dict]) -> dict[str, np.ndarray]:
-    """Pixels whose centre falls in each area (GeoJSON in WGS84), on the store grid."""
-    from pyproj import Transformer
-    from rasterio.features import geometry_mask
+def _grid(ds: xr.Dataset):
+    """Shape and affine transform (pixel corners) of a store's grid."""
     from rasterio.transform import Affine
+
+    x, y = ds["x"].values, ds["y"].values
+    rx, ry = float(x[1] - x[0]), float(y[1] - y[0])
+    return (len(y), len(x)), Affine(rx, 0, x[0] - rx / 2, 0, ry, y[0] - ry / 2)
+
+
+def _to_grid_crs(ds: xr.Dataset):
+    from pyproj import Transformer
+
+    return Transformer.from_crs("EPSG:4326", crs_of(ds), always_xy=True).transform
+
+
+def area_masks(ds: xr.Dataset, areas: dict[str, dict]) -> dict[str, np.ndarray]:
+    """Pixels whose centre falls in each area (GeoJSON in WGS84), on the store grid: one boolean
+    image per area. For many areas (the communes of a département), see :func:`area_zones`."""
+    from rasterio.features import geometry_mask
     from shapely.geometry import mapping, shape
     from shapely.ops import transform
 
-    to_utm = Transformer.from_crs("EPSG:4326", crs_of(ds), always_xy=True).transform
-    x, y = ds["x"].values, ds["y"].values
-    rx, ry = float(x[1] - x[0]), float(y[1] - y[0])
-    aff = Affine(rx, 0, x[0] - rx / 2, 0, ry, y[0] - ry / 2)
-    return {code: geometry_mask([mapping(transform(to_utm, shape(g)))], out_shape=(len(y), len(x)),
+    out_shape, aff = _grid(ds)
+    to_grid = _to_grid_crs(ds)
+    return {code: geometry_mask([mapping(transform(to_grid, shape(g)))], out_shape=out_shape,
                                 transform=aff, invert=True)
             for code, g in areas.items()}
 
 
+def area_zones(ds: xr.Dataset, areas: dict[str, dict], partition: set[str] = frozenset()) -> dict[str, np.ndarray]:
+    """Pixels whose centre falls in each area, as flat indices into the store grid (int32, sorted).
+
+    The areas of ``partition`` (the communes, which do not overlap) are drawn into one label image
+    and split by label: memory grows with the site's pixels, not with the number of communes
+    (one boolean image per commune of a département would take tens of GB). The other areas (the
+    site, the farm) get one mask each.
+    """
+    from rasterio.features import rasterize
+    from shapely.geometry import mapping, shape
+    from shapely.ops import transform
+
+    out_shape, aff = _grid(ds)
+    to_grid = _to_grid_crs(ds)
+    zones: dict[str, np.ndarray] = {}
+    labelled = [c for c in areas if c in partition]
+    if labelled:
+        lab = rasterize([(mapping(transform(to_grid, shape(areas[c]))), k + 1) for k, c in enumerate(labelled)],
+                        out_shape=out_shape, transform=aff, fill=0, dtype="int32").ravel()
+        order = np.argsort(lab, kind="stable").astype("int32")       # pixels grouped by label, ascending
+        bounds = np.searchsorted(lab[order], np.arange(len(labelled) + 2))
+        for k, c in enumerate(labelled):
+            zones[c] = order[bounds[k + 1]:bounds[k + 2]]
+    for c, m in area_masks(ds, {c: g for c, g in areas.items() if c not in partition}).items():
+        zones[c] = np.flatnonzero(m.ravel()).astype("int32")
+    return zones
+
+
 def area_stats(ds_date: xr.Dataset, masks: dict[str, np.ndarray], indices: list[str]) -> list[dict]:
-    """Statistics of each index over each area for one (loaded) date."""
-    return area_stats_parts([(ds_date, masks)], {c: int(m.sum()) for c, m in masks.items()}, indices)
+    """Statistics of each index over each area for one (loaded) date (areas as boolean images)."""
+    zones = {c: np.flatnonzero(m.ravel()).astype("int32") for c, m in masks.items()}
+    return area_stats_parts([(ds_date, zones)], {c: int(z.size) for c, z in zones.items()}, indices)
 
 
 def area_stats_parts(pieces: list[tuple[xr.Dataset, dict[str, np.ndarray]]], n_area: dict[str, int],
                      indices: list[str]) -> list[dict]:
     """Statistics of each index over each area for one date seen in one or more parts.
 
-    ``pieces``: (loaded date of a part, area masks on that part's grid) for the parts that have the
-    date; ``n_area``: pixels of each area over all the parts (the clear fraction is relative to it).
+    ``pieces``: (loaded date of a part, area pixels on that part's grid as flat indices, see
+    :func:`area_zones`) for the parts that have the date; ``n_area``: pixels of each area over all
+    the parts (the clear fraction is relative to it).
     """
     prepared = []
-    for ds_date, masks in pieces:
-        scl = ds_date["SCL"].values
-        clear = clear_mask_ds(ds_date)
-        values = {name: index_array(ds_date, name) for name in indices}     # once per part and date
-        prepared.append((scl, clear, values, masks))
+    for ds_date, zones in pieces:
+        scl = ds_date["SCL"].values.ravel()
+        clear = clear_mask_ds(ds_date).ravel()
+        values = {name: index_array(ds_date, name).ravel() for name in indices}     # once per part and date
+        prepared.append((scl, clear, values, zones))
     rows = []
     for code, total in n_area.items():
         n_valid = n_clear = 0
         vals = {name: [] for name in indices}
-        for scl, clear, values, masks in prepared:
-            m = masks.get(code)
-            if m is None or not m.any():
+        for scl, clear, values, zones in prepared:
+            idx = zones.get(code)
+            if idx is None or not idx.size:
                 continue
-            n_valid += int((m & (scl > 0)).sum())
-            n_clear += int((m & clear).sum())
+            n_valid += int((scl[idx] > 0).sum())
+            n_clear += int(clear[idx].sum())
             for name in indices:
-                vals[name].append(values[name][m])
+                vals[name].append(values[name][idx])
         for name in indices:
             v = np.concatenate(vals[name]) if vals[name] else np.zeros(0, dtype="float32")
             v = v[np.isfinite(v)]

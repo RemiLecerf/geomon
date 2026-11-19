@@ -25,22 +25,6 @@ log = logging.getLogger(__name__)
 
 FARM_CODE = "farm"
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS ref.farm_plot (
-    id         serial PRIMARY KEY,
-    site       text,                  -- site the plots belong to
-    campaign   int,                   -- PAC campaign (CAMPAGNE)
-    number     text,                  -- plot or island number (NUMERO)
-    island     text,                  -- reference island (ILOT_REF)
-    commune    text,                  -- INSEE code declared (COMMUNE)
-    surf_ha    double precision,      -- declared area (SURF_TOT), ha
-    props      jsonb NOT NULL DEFAULT '{}'::jsonb,
-    geom       geometry(MultiPolygon, 4326) NOT NULL
-);
-CREATE INDEX IF NOT EXISTS farm_plot_geom_idx ON ref.farm_plot USING gist (geom);
-ALTER TABLE ref.farm_plot ADD COLUMN IF NOT EXISTS site text;
-"""
-
 
 def farm_path() -> Path | None:
     if not settings.farm_file:
@@ -67,7 +51,6 @@ def run(aoi: AOI) -> dict:
         return next((p[n] for n in names if p.get(n) not in (None, "")), None)
 
     with connect() as conn:
-        conn.execute(_SCHEMA)
         conn.execute("DELETE FROM ref.farm_plot WHERE site = %s", (aoi.code,))
         with conn.cursor() as cur:
             cur.executemany(

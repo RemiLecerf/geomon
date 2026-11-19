@@ -72,34 +72,36 @@ const RPG_COLORS = {
 const rpgColorExpr = ["match", ["to-number", ["get", "code_group"]],
   ...Object.entries(RPG_COLORS).flatMap(([k, c]) => [Number(k), c]), "#adb5bd"];
 
+// tiles: vector tiles of that layer (only the tiles in view are loaded, from zoom minzoom);
+// source: a GeoJSON loaded whole (small layers)
 const VECTOR_LAYERS = [
-  { id: "osm-landuse", label: "OSM land use", source: "/api/osm/landuse.geojson", on: false,
+  { id: "osm-landuse", label: "OSM land use", tiles: "landuse", minzoom: 10, on: false,
     layers: [{ type: "fill", paint: { "fill-color": ["match", ["get", "kind"],
       ["forest", "wood"], "#7fb77e", ["meadow", "grassland"], "#c5e1a5", ["farmland"], "#f3e9c6",
       ["orchard", "vineyard"], "#d9a9a0", ["residential"], "#e0d6d6", "#d6dcc7"], "fill-opacity": 0.45 } }],
     swatch: "#7fb77e" },
-  { id: "rpg", label: "RPG 2025 parcels", source: "/api/rpg.geojson", on: true,
+  { id: "rpg", label: "RPG parcels (latest year)", tiles: "rpg", minzoom: 9, on: true,
     layers: [
       { type: "fill", paint: { "fill-color": rpgColorExpr,
         "fill-opacity": ["case", ["get", "in_commune"], 0.6, 0.3] } },
       { type: "line", paint: { "line-color": "#3d3d3d", "line-width": 0.4, "line-opacity": 0.6 } },
     ], swatch: "#57a773" },
-  { id: "osm-water", label: "OSM water", source: "/api/osm/water.geojson", on: true,
+  { id: "osm-water", label: "OSM water", tiles: "water", minzoom: 9, on: true,
     layers: [{ type: "fill", paint: { "fill-color": "#6aa9d8", "fill-opacity": 0.7 } }], swatch: "#6aa9d8" },
-  { id: "osm-waterways", label: "OSM waterways", source: "/api/osm/waterways.geojson", on: true,
+  { id: "osm-waterways", label: "OSM waterways", tiles: "waterways", minzoom: 9, on: true,
     layers: [{ type: "line", paint: { "line-color": "#3a86c8",
       "line-width": ["match", ["get", "kind"], ["river"], 2.5, ["stream"], 1.2, 0.8] } }], swatch: "#3a86c8" },
-  { id: "osm-buildings", label: "OSM buildings", source: "/api/osm/buildings.geojson", on: false,
+  { id: "osm-buildings", label: "OSM buildings", tiles: "buildings", minzoom: 13, on: false,
     layers: [{ type: "fill", paint: { "fill-color": "#8d7b6a", "fill-opacity": 0.8 } }], swatch: "#8d7b6a" },
-  { id: "osm-roads", label: "OSM roads", source: "/api/osm/roads.geojson", on: false,
+  { id: "osm-roads", label: "OSM roads", tiles: "roads", minzoom: 10, on: false,
     layers: [{ type: "line", paint: { "line-color": ["match", ["get", "kind"],
       ["motorway", "trunk", "primary"], "#d1495b", ["secondary", "tertiary"], "#edae49", "#6c757d"],
       "line-width": ["match", ["get", "kind"], ["motorway", "trunk", "primary"], 3,
         ["secondary", "tertiary"], 2, ["track", "path", "footway"], 0.6, 1.2] } }], swatch: "#edae49" },
-  { id: "osm-railways", label: "OSM railways", source: "/api/osm/railways.geojson", on: false,
+  { id: "osm-railways", label: "OSM railways", tiles: "railways", minzoom: 9, on: false,
     layers: [{ type: "line", paint: { "line-color": "#333", "line-width": 1.5, "line-dasharray": [3, 2] } }],
     swatch: "#333" },
-  { id: "osm-pois", label: "OSM places & POIs", source: "/api/osm/pois.geojson", on: false,
+  { id: "osm-pois", label: "OSM places & POIs", tiles: "pois", minzoom: 12, on: false,
     layers: [{ type: "circle", paint: { "circle-radius": 4, "circle-color": "#6f42c1",
       "circle-stroke-color": "#fff", "circle-stroke-width": 1 } }], swatch: "#6f42c1" },
   { id: "admin", label: "Communes & EPCI (AOI communes in red)", source: "/api/admin.geojson?levels=COM,EPCI", on: true,
@@ -123,13 +125,28 @@ function addAreaLayer() {
     paint: { "line-color": "#c0392b", "line-width": 3.5, "line-opacity": 0.9 } });
 }
 
+const EMPTY_FC = { type: "FeatureCollection", features: [] };
+
 function addVectorLayers() {
+  const site = encodeURIComponent(aoiInfo.code);
   for (const v of VECTOR_LAYERS) {
-    map.addSource(v.id, { type: "geojson", data: v.source });
+    if (v.tiles) {
+      // Tiles are only requested while one of the source's layers is visible. Tile URLs must be
+      // absolute (they are fetched by the map's web workers).
+      map.addSource(v.id, { type: "vector", minzoom: v.minzoom ?? 0, maxzoom: 15,
+        tiles: [`${location.origin}/api/tiles/${v.tiles}/{z}/{x}/{y}.pbf?site=${site}`] });
+      v.loaded = true;
+    } else {
+      // A GeoJSON source is downloaded as soon as it is added, even when its layers are hidden:
+      // layers that start hidden get their data the first time they are shown
+      map.addSource(v.id, { type: "geojson", data: v.on ? v.source : EMPTY_FC });
+      v.loaded = v.on;
+    }
     v.layers.forEach((l, i) => {
       const id = `${v.id}-${i}`;
       if (!firstVectorLayer) firstVectorLayer = id;
-      map.addLayer({ id, source: v.id, ...l, layout: { ...(l.layout || {}), visibility: v.on ? "visible" : "none" } });
+      map.addLayer({ id, source: v.id, ...(v.tiles ? { "source-layer": v.tiles } : {}), ...l,
+        layout: { ...(l.layout || {}), visibility: v.on ? "visible" : "none" } });
     });
   }
   $("#vector-layers").innerHTML = VECTOR_LAYERS.map((v) =>
@@ -137,6 +154,7 @@ function addVectorLayers() {
      <span class="swatch" style="background:${v.swatch}"></span> ${v.label}</label>`).join("");
   $("#vector-layers").addEventListener("change", (e) => {
     const v = VECTOR_LAYERS.find((x) => x.id === e.target.value);
+    if (e.target.checked && !v.loaded) { map.getSource(v.id).setData(v.source); v.loaded = true; }
     v.layers.forEach((_, i) => map.setLayoutProperty(`${v.id}-${i}`, "visibility", e.target.checked ? "visible" : "none"));
   });
 }
@@ -190,8 +208,12 @@ async function updateRaster() {
   const depth = meta.has_depth ? Number(depthSel.value || 0) : 0;
   const q = `depth=${depth}`;
   const info = await api(`/api/raster/${name}/${variable}/info?${q}`);
-  map.addSource("raster", { type: "image", url: `/api/raster/${name}/${variable}.png?${q}`,
-    coordinates: info.coordinates });
+  if ($("#raster-var").value !== value) return;   // another variable chosen meanwhile
+  if (map.getLayer("raster")) map.removeLayer("raster");
+  if (map.getSource("raster")) map.removeSource("raster");
+  // XYZ tiles at the resolution of the zoom (beyond maxzoom, the deepest tiles are enlarged)
+  map.addSource("raster", { type: "raster", tiles: [`${location.origin}${info.tiles}`], tileSize: 256,
+    bounds: info.bounds, maxzoom: info.maxzoom });
   map.addLayer({ id: "raster", type: "raster", source: "raster",
     paint: { "raster-opacity": Number($("#raster-opacity").value), "raster-resampling": "nearest" } },
     firstVectorLayer);
@@ -234,8 +256,14 @@ const areaOf = (code) => aoiInfo.areas.find((a) => a.code === code);
 const areaLabel = (a) => a.kind === "site" ? `Group — ${a.name} (${a.members.length} communes)`
   : a.kind === "farm" ? `${a.name} — ${a.plots} plots, ${fmt(a.declared_ha ?? a.area_ha, 1)} ha` : `${a.name} (${a.code})`;
 
+// Beyond this many communes (a département site), lists group them instead of showing each one
+const MANY_COMMUNES = 12;
+
 function renderHierarchy() {
-  $("#hierarchy").innerHTML = aoiInfo.hierarchy.map((h) =>
+  const many = aoiInfo.communes.length > MANY_COMMUNES;
+  const shown = many ? aoiInfo.hierarchy.filter((h) => h.level !== "COM") : aoiInfo.hierarchy;
+  $("#hierarchy").innerHTML = (many ? `<div class="lvl"><span class="k">Communes</span><span>${aoiInfo.communes.length} (choose one in the Area menu)</span></div>` : "") +
+    shown.map((h) =>
     `<div class="lvl"><span class="k">${esc(h.level_name)}</span><span>${esc(h.name)} <span class="muted">(${esc(h.code)})</span></span></div>`
   ).join("") + `<div class="muted" style="font-size:11px;margin-top:4px">Geography: COG ${aoiInfo.hierarchy[0]?.vintage ?? ""}, valid from ${aoiInfo.hierarchy[0]?.valid_from ?? ""}</div>`;
   // Statistics areas: the group (sums of the communes), each commune, then the parent units
@@ -247,7 +275,24 @@ function renderHierarchy() {
 }
 
 function renderAreaSelector() {
-  $("#area").innerHTML = aoiInfo.areas.map((a) => `<option value="${esc(a.code)}">${esc(areaLabel(a))}</option>`).join("");
+  const option = (a) => `<option value="${esc(a.code)}">${esc(areaLabel(a))}</option>`;
+  const communes = aoiInfo.areas.filter((a) => a.kind === "commune");
+  if (communes.length > MANY_COMMUNES) {
+    // Many communes: grouped by intercommunality (EPCI), alphabetically within each
+    const epciOf = Object.fromEntries(aoiInfo.communes.map((c) => [c.code, c.epci]));
+    const epciName = Object.fromEntries(aoiInfo.hierarchy.filter((h) => h.level === "EPCI").map((h) => [h.code, h.name]));
+    const groups = new Map();
+    for (const a of [...communes].sort((x, y) => x.name.localeCompare(y.name))) {
+      const k = epciOf[a.code] || "";
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(a);
+    }
+    const sorted = [...groups.entries()].sort(([a], [b]) => (epciName[a] || "~").localeCompare(epciName[b] || "~"));
+    $("#area").innerHTML = aoiInfo.areas.filter((a) => a.kind !== "commune").map(option).join("") +
+      sorted.map(([k, list]) => `<optgroup label="${esc(epciName[k] || "Other communes")} (${list.length})">${list.map(option).join("")}</optgroup>`).join("");
+  } else {
+    $("#area").innerHTML = aoiInfo.areas.map(option).join("");
+  }
   $("#area-row").hidden = aoiInfo.areas.length < 2;
   $("#area").addEventListener("change", (e) => setArea(e.target.value, true));
 }
@@ -383,18 +428,25 @@ async function updateTable() {
 // Categorical slots 1-3 of the reference palette plus a deeper magenta for AgERA5
 // (slot 4 yellow and slot 5 magenta are too close to orange: validated all-pairs;
 // aqua is below 3:1 on white, so the legend and the comparison table carry the labels).
+// ERA5 shares ERA5-Land's orange, dashed: the same family (ERA5-Land re-runs ERA5's land model),
+// and no fifth hue passes against these four (violet ~ blue, yellow and red ~ orange, green ~
+// orange for protans: validated all-pairs), so the dash is the second encoding.
 const WX_SERIES = [
   { key: "mf", label: "Météo-France AROME/ARPEGE", color: "#2a78d6", product: "om_mf_hist" },
-  { key: "era5land", label: "ERA5-Land / ERA5", color: "#eb6834", product: "om_era5land" },
+  { key: "era5land", label: "ERA5-Land", color: "#eb6834", product: "era5land" },
+  { key: "era5", label: "ERA5", color: "#eb6834", dash: "5 3", product: "era5" },
   { key: "agera5", label: "AgERA5", color: "#c2407a", product: "agera5" },
   { key: "sim2", label: "SIM2 / SAFRAN", color: "#1baf7a", product: "sim2" },
 ];
 const WX_GROUPS = [
   ["Temperature", /^t_/], ["Precipitation and water", /^(precip|rain|snowfall|et0|evap|effective_rain|drainage|runoff)/],
-  ["Radiation", /^(radiation|longwave)/], ["Humidity", /^(rh_|vp|q_)/], ["Wind and clouds", /^(wind|cloud)/],
+  ["Radiation and energy", /^(radiation|longwave|sensible)/], ["Humidity", /^(rh_|vp|q_)/],
+  ["Wind, clouds and boundary layer", /^(wind|gust|cloud|blh)/],
   ["Snow", /^(snow_depth|swe)/], ["Soil", /^(soil_|swi|wg_)/],
 ];
 const wx = { catalogue: null, lngLat: null, isCentre: true, seq: 0 };
+// Swatch of a series: its colour, dashed like its line when it has a dash
+const swatchBg = (s) => (s.dash ? `repeating-linear-gradient(90deg,${s.color} 0 4px,transparent 4px 6px)` : s.color);
 
 async function initWeather() {
   wx.catalogue = await api("/api/weather/products");
@@ -413,7 +465,7 @@ async function initWeather() {
   $("#wx-series").innerHTML = WX_SERIES.map((s) => {
     const meta = wx.catalogue.series.find((c) => c.key === s.key);
     return `<label><input type="checkbox" value="${s.key}" ${meta?.available ? "checked" : "disabled"}>
-      <span class="swatch" style="background:${s.color}"></span> ${esc(meta?.label || s.label)}</label>`;
+      <span class="swatch" style="background:${swatchBg(s)}"></span> ${esc(meta?.label || s.label)}</label>`;
   }).join("");
   for (const id of ["#wx-var", "#wx-period", "#wx-series"]) $(id).addEventListener("change", updateWeather);
   fillNormalYears();
@@ -426,10 +478,11 @@ async function initWeather() {
   const p = Object.fromEntries(wx.catalogue.products.map((x) => [x.name, x]));
   $("#wx-sources").innerHTML = `Météo-France archived forecasts at Open-Meteo: AROME HD 1.5 km (temperature, humidity, wind;
     precipitation from 2024), AROME 2.5 km (all variables from 2024-01-02), ARPEGE 11 km before.
-    ERA5-Land 0.1°; rain, wind, radiation and ET0 from ERA5 0.25° (not served for ERA5-Land). Forecast: AROME/ARPEGE
+    ERA5-Land 0.1° (soil and snow) and ERA5 0.25° (cloud cover, boundary layer, gusts, heat fluxes), hourly, from the Copernicus CDS, about 10 days behind;
+    their ET0 is computed (FAO-56 hourly), ERA5's actual evapotranspiration comes from its latent heat flux. Forecast: AROME/ARPEGE
     up to ~4 days, then ECMWF IFS 9 km to 15 days. AgERA5 (Copernicus CDS): ERA5 corrected to 0.1°, about 10 days behind. Daily values over the local day (${esc(wx.catalogue.local_time_zone)});
     SIM2 keeps Météo-France's day definitions (rain and ET over 06–06 UTC).
-    Updated: ${["om_mf_hist", "om_forecast", "om_era5land", "agera5", "sim2"].map((n) => p[n]?.updated ? `${n} ${p[n].updated.slice(0, 16).replace("T", " ")} UTC` : "").filter(Boolean).join(" · ")}.`;
+    Updated: ${["om_mf_hist", "om_forecast", "era5land", "era5", "om_era5land", "agera5", "sim2"].map((n) => p[n]?.updated ? `${n} ${p[n].updated.slice(0, 16).replace("T", " ")} UTC` : "").filter(Boolean).join(" · ")}.`;
 }
 
 function weatherPeriod() {
@@ -571,10 +624,10 @@ function weatherChart(series, step) {
       p += `${pen ? "L" : "M"}${sx(d).toFixed(1)},${sy(v).toFixed(1)}`;
       pen = true;
     });
-    return `<path d="${p}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    return `<path d="${p}" fill="none" stroke="${s.color}" stroke-width="2" ${s.dash ? `stroke-dasharray="${s.dash}"` : ""} stroke-linejoin="round" stroke-linecap="round"/>`;
   }).join("");
   const legend = series.length > 1 ? `<div class="wx-legend">${series.map((s) =>
-    `<span class="k"><span class="line" style="background:${s.color}"></span>${esc(s.label)}
+    `<span class="k"><span class="line" style="background:${swatchBg(s)}"></span>${esc(s.label)}
      <span class="muted">${s.point ? `· ${fmt(s.point.distance_km, 1)} km` : ""}</span></span>`).join("")}</div>` : "";
   return `${legend}<div class="wx-plot"><svg viewBox="0 0 ${WX_W} ${WX_H}" role="img" aria-label="Weather chart">
     ${band}
@@ -604,7 +657,7 @@ function bindWeatherHover(series, u) {
     dots.innerHTML = rows.filter((r) => r.v !== null).map((r) =>
       `<circle cx="${x}" cy="${sy(r.v)}" r="4" fill="${r.s.color}" stroke="#fff" stroke-width="2"/>`).join("");
     tip.innerHTML = `<div class="d">${best}${ff && best >= ff && $("#wx-period").value === "60d" ? ' <span class="fc">forecast</span>' : ""}</div>` +
-      rows.map((r) => `<div class="r"><span class="swatch" style="background:${r.s.color}"></span>${esc(r.s.label)}<b>${r.v === null ? "–" : `${fmt(r.v, 1)} ${esc(u)}`}</b></div>`).join("");
+      rows.map((r) => `<div class="r"><span class="swatch" style="background:${swatchBg(r.s)}"></span>${esc(r.s.label)}<b>${r.v === null ? "–" : `${fmt(r.v, 1)} ${esc(u)}`}</b></div>`).join("");
     placeTip(tip, svg, x, WX_W);
   });
   hit.addEventListener("pointerleave", () => hideCrosshair(cross, dots, tip));
@@ -630,7 +683,7 @@ function weatherCompare(series, variable, u) {
         corr = va && vb ? fmt(cov / Math.sqrt(va * vb), 2) : "–";
       }
     }
-    return `<tr><td><span class="swatch" style="background:${s.color}"></span> ${esc(s.label)}</td>
+    return `<tr><td><span class="swatch" style="background:${swatchBg(s)}"></span> ${esc(s.label)}</td>
       <td class="num">${pts.length}</td><td class="num">${fmt(mean, 2)}</td><td class="num">${diff || "–"}</td><td class="num">${corr || "–"}</td>
       <td class="num">${s.point ? `${fmt(s.point.distance_km, 1)} km` : s.cells ? `${s.cells.length} cell${s.cells.length > 1 ? "s" : ""}` : "–"}</td></tr>`;
   }).join("");
@@ -831,7 +884,8 @@ async function updateWeatherCells() {
   for (const s of WX_SERIES.filter((x) => keys.includes(x.key))) {
     map.addSource(`wx-${s.key}`, { type: "geojson", data: `/api/weather/cells.geojson?product=${s.product}` });
     map.addLayer({ id: `wx-${s.key}-fill`, type: "fill", source: `wx-${s.key}`, paint: { "fill-color": s.color, "fill-opacity": 0.06 } });
-    map.addLayer({ id: `wx-${s.key}-line`, type: "line", source: `wx-${s.key}`, paint: { "line-color": s.color, "line-width": 1.5 } });
+    map.addLayer({ id: `wx-${s.key}-line`, type: "line", source: `wx-${s.key}`,
+      paint: { "line-color": s.color, "line-width": 1.5, ...(s.dash ? { "line-dasharray": s.dash.split(" ").map(Number) } : {}) } });
   }
 }
 

@@ -43,28 +43,13 @@ from .. import sentinel2 as s2
 from ..aoi import AOI
 from ..config import settings
 from ..db import connect
+from ..zarrio import write_atomic
 
 log = logging.getLogger(__name__)
 
 SYNC_MAX_DAYS = 45          # longer periods go through batch jobs
 TIME_BLOCK = 8              # dates read at once from an openEO result (memory: 8 x the AOI grid)
 OVERLAP_DAYS = 3            # scenes can be published a little after later ones
-
-_SCHEMA = """
-CREATE SCHEMA IF NOT EXISTS eo;
-CREATE TABLE IF NOT EXISTS eo.index_stats (
-    site            text NOT NULL,
-    area            text NOT NULL,        -- site code or INSEE commune code
-    date            date NOT NULL,
-    index           text NOT NULL,        -- ndvi, ndre, ...
-    mean            real, median real, p10 real, p90 real, std real,
-    n_area          int,                  -- pixels in the area
-    n_valid         int,                  -- pixels with data
-    n_clear         int,                  -- clear pixels (SCL 4, 5, 6 and red reflectance < 0.25)
-    clear_fraction  real,
-    PRIMARY KEY (site, area, index, date)
-);
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -225,22 +210,7 @@ def _per_date(ds: xr.Dataset) -> xr.Dataset:
 
 
 def _write_new(ds: xr.Dataset, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.zarr")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    _per_date(ds).to_zarr(tmp, mode="w", consolidated=True, encoding=_encoding(ds))
-    for attempt in range(5):
-        try:
-            if path.exists():
-                shutil.rmtree(path)
-            tmp.rename(path)
-            break
-        except OSError:
-            time.sleep(1 + attempt)
-    else:
-        shutil.copytree(tmp, path)
-        shutil.rmtree(tmp, ignore_errors=True)
+    write_atomic(_per_date(ds), path, encoding=_encoding(ds))
 
 
 def _fractions(ds: xr.Dataset, site_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -270,10 +240,15 @@ def _keep_clear(ds: xr.Dataset, site_mask: np.ndarray) -> xr.Dataset:
 
 
 def _areas() -> dict[str, dict]:
+    """The site's areas: {code: outline (GeoJSON)}; their kinds in ``_COMMUNES``."""
     with connect() as conn:
         rows = conn.execute("SELECT code, kind, ST_AsGeoJSON(geom) AS g FROM meta.aoi WHERE site = %s "
                             "ORDER BY position", (settings.site_code,)).fetchall()
+    _COMMUNES[settings.site_code] = {r["code"] for r in rows if r["kind"] == "commune"}
     return {r["code"]: json.loads(r["g"]) for r in rows}
+
+
+_COMMUNES: dict[str, set[str]] = {}      # site -> its commune codes (they partition the site)
 
 
 # ---------------------------------------------------------------------------
@@ -332,8 +307,6 @@ def _part_bounds(part: Part, crs: str) -> tuple[float, float, float, float]:
 def _migrate_to_parts(site: str, parts_def: list[Part]) -> list:
     """Stores of a site kept as one grid while its communes form several parts: cropped into the
     parts' grids (no download). Returns the dates written, for the statistics."""
-    import shutil as _sh
-
     years = s2.years(site, "")
     if not years or len(parts_def) < 2:
         return []
@@ -356,7 +329,7 @@ def _migrate_to_parts(site: str, parts_def: list[Part]) -> list:
             _write_new(sub, _store(part, y))
             written += list(sub["time"].values)
         s2.clear_cache()
-        _sh.rmtree(src)
+        shutil.rmtree(src)
         log.info("Sentinel-2 %s %d: split into %s", site, y, ", ".join(q.part for q in parts_def))
     return written
 
@@ -371,19 +344,21 @@ def _store_stats(site: str, dates, areas: dict[str, dict]) -> int:
     if not days:
         return 0
     plist = s2.parts(site)
-    masks: dict[tuple, dict] = {}
+    zones: dict[tuple, dict] = {}
+    communes = _COMMUNES.get(site, set())
 
-    def masks_of(part: str, ds: xr.Dataset) -> dict:
+    def zones_of(part: str, ds: xr.Dataset) -> dict:
+        """Pixels of every area on a part's grid (flat indices; the communes from one label image)."""
         key = (part, float(ds["x"].values[0]), float(ds["y"].values[0]), ds.sizes["x"], ds.sizes["y"])
-        if key not in masks:
-            masks[key] = s2.area_masks(ds, areas)
-        return masks[key]
+        if key not in zones:
+            zones[key] = s2.area_zones(ds, areas, communes)
+        return zones[key]
 
     n_area = {code: 0 for code in areas}         # pixels of each area over all the parts
     for part in plist:
         ds = s2.open_year(site, s2.years(site, part)[0], part)
-        for code, m in masks_of(part, ds).items():
-            n_area[code] += int(m.sum())
+        for code, z in zones_of(part, ds).items():
+            n_area[code] += int(z.size)
     n = 0
     by_year: dict[int, list] = {}
     for d in days:
@@ -398,14 +373,13 @@ def _store_stats(site: str, dates, areas: dict[str, dict]) -> int:
             for part, ds in stores.items():
                 hit = np.nonzero(times[part] == d)[0]
                 if hit.size:
-                    pieces.append((ds.isel(time=int(hit[0])).load(), masks_of(part, ds)))
+                    pieces.append((ds.isel(time=int(hit[0])).load(), zones_of(part, ds)))
             if not pieces:
                 continue
             indices = sorted(set.intersection(*(set(s2.available_indices(p.data_vars)) for p, _ in pieces)))
             for r in s2.area_stats_parts(pieces, n_area, indices):
                 rows.append(r | {"site": site, "date": str(d)})
         with connect() as conn:
-            conn.execute(_SCHEMA)
             with conn.cursor() as cur:
                 cur.executemany(
                     """INSERT INTO eo.index_stats (site, area, date, index, mean, median, p10, p90, std,
@@ -557,7 +531,6 @@ def recompute(aoi: AOI) -> dict:
     parts_def = split_parts(aoi)
     _migrate_to_parts(aoi.code, parts_def)
     with connect() as db:
-        db.execute(_SCHEMA)
         db.execute("DELETE FROM eo.index_stats WHERE site = %s", (aoi.code,))
     dates = []
     for part in parts_def:
@@ -611,8 +584,6 @@ def run(aoi: AOI) -> dict:
         return {"skipped": "no openEO login (run the sentinel2-login step)"}
     conn = _connection()
     areas = _areas()
-    with connect() as db:
-        db.execute(_SCHEMA)
     parts_def = split_parts(aoi)
     if len(parts_def) > 1:
         log.info("Sentinel-2 %s: %d parts (%s)", aoi.code, len(parts_def),

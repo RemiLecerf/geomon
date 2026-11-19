@@ -6,7 +6,6 @@ import io
 from functools import lru_cache
 
 import numpy as np
-import pandas as pd
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 from matplotlib import colormaps
@@ -19,6 +18,7 @@ from .. import parcels as pc
 from .. import sentinel2 as s2
 from ..config import settings
 from ..db import connect
+from .areas import site_row
 
 router = APIRouter(prefix="/api/s2", tags=["sentinel-2"])
 
@@ -27,11 +27,7 @@ _merc_to_wgs = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
 
 def _site() -> str:
     with connect() as conn:
-        row = conn.execute("SELECT code FROM meta.aoi WHERE kind = 'site' AND code = %s",
-                           (settings.site_code,)).fetchone()
-    if not row:
-        raise HTTPException(503, "No AOI yet")
-    return row["code"]
+        return site_row(conn)["code"]
 
 
 @router.get("/info")
@@ -78,13 +74,12 @@ def series(index: str = "ndvi", area: str | None = None, min_clear: float = 0.9)
     site = _site()
     area = area or site
     with connect() as conn:
-        exists = conn.execute("SELECT to_regclass('eo.index_stats') AS t").fetchone()["t"]
         rows = conn.execute(
             """SELECT date, mean, median, p10, p90, std, n_clear, n_area, clear_fraction
                FROM eo.index_stats WHERE site = %s AND area = %s AND index = %s AND clear_fraction >= %s
                ORDER BY date""",
             (site, area, index, min_clear),
-        ).fetchall() if exists else []
+        ).fetchall()
     return {"site": site, "area": area, "index": index, "long_name": s2.INDICES[index].long_name,
             "min_clear": min_clear,
             "points": [{"date": r["date"].isoformat(), **{k: (None if r[k] is None else round(float(r[k]), 4))
@@ -119,7 +114,7 @@ def _render(site: str, date: str, index: str, masked: bool, part: str = "") -> t
     rgba = (cmap(np.nan_to_num(norm)) * 255).astype("uint8")
     rgba[..., 3] = np.where(np.isfinite(dst), 230, 0)
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG")      # optimize=True: several times slower
     x0, y1 = dst_transform.c, dst_transform.f
     x1, y0 = x0 + dw * dst_transform.a, y1 + dh * dst_transform.e
     coords = [list(_merc_to_wgs.transform(cx, cy)) for cx, cy in ((x0, y1), (x1, y1), (x1, y0), (x0, y0))]
@@ -163,24 +158,18 @@ def image_png(index: str, date: str, masked: bool = True, part: str = "") -> Res
 # ---------------------------------------------------------------------------
 def _crop_labels(conn) -> tuple[dict, dict]:
     """(year, crop code) -> label, and group code -> label (latest year that has it)."""
-    rows = conn.execute("SELECT year, code_culture, label, code_group, label_group FROM ref.rpg_crop_code "
-                        "ORDER BY year").fetchall()
+    rows = conn.execute("SELECT year, code_culture, label FROM ref.rpg_crop_code").fetchall()
     crops = {(r["year"], r["code_culture"]): r["label"] for r in rows}
-    groups = {}
-    for r in rows:
-        if r["code_group"] and r["label_group"]:
-            groups[r["code_group"]] = r["label_group"]
+    # A group's most frequent label in each year (a code list may give a group two labels)
+    groups = {r["code_group"]: r["label"] for r in conn.execute(
+        """SELECT year, code_group, mode() WITHIN GROUP (ORDER BY label_group) AS label FROM ref.rpg_crop_code
+           WHERE code_group IS NOT NULL AND label_group IS NOT NULL GROUP BY 1, 2 ORDER BY 1""").fetchall()}
     return crops, groups
 
 
-def _curves(index: str):
+def _check_index(index: str) -> None:
     if index not in s2.INDICES:
         raise HTTPException(404, f"Unknown index {index}")
-    site = _site()
-    df, mat = pc.curves(site, index, pc.stamp(site))
-    if not len(df):
-        raise HTTPException(404, "No parcel series yet: run docker compose run --rm ingest sentinel2-parcels")
-    return site, df, mat
 
 
 def _season_info(season: int) -> dict:
@@ -188,32 +177,38 @@ def _season_info(season: int) -> dict:
             "jan1_day": pc.JAN1, "days": pc.SEASON_DAYS}
 
 
-def _in_area(df, area: str):
-    return df["areas"].apply(lambda a: area in a)
+_NO_SERIES = "No parcel series yet: run docker compose run --rm ingest sentinel2-parcels"
 
 
 @router.get("/crops")
 def crops(index: str = "ndvi", area: str | None = None, season: int | None = None) -> dict:
     """Seasons with parcel curves, and the crop groups of an area in a season (parcels, area)."""
-    site, df, _ = _curves(index)
+    _check_index(index)
+    site = _site()
     area = area or site
     with connect() as conn:
         _, glabels = _crop_labels(conn)
         years_rpg = pc.rpg_years(conn)
-    seasons = sorted(int(s) for s in df["season"].unique())
-    season = season or max(s for s in seasons if s <= max(years_rpg))
-    known = df[_in_area(df, area) & (df["crop_status"] != "unknown")]
-    cur = known[known["season"] == season]
+        seasons = [r["season"] for r in conn.execute(
+            "SELECT DISTINCT season FROM eo.group_season WHERE site = %s AND index = %s ORDER BY 1",
+            (site, index)).fetchall()]
+        rows = conn.execute(
+            "SELECT season, code_group, parcels, ha, status FROM eo.group_season WHERE site = %s AND index = %s "
+            "AND area = %s", (site, index, area)).fetchall()
+    if not seasons:
+        raise HTTPException(404, _NO_SERIES)
+    # Default: the latest season whose RPG is published (else the latest season)
+    season = season or max((s for s in seasons if s <= max(years_rpg)), default=seasons[-1])
+    known = [r for r in rows if r["code_group"]]
     groups = []
-    for code in known["code_group"].dropna().unique():
-        g = cur[cur["code_group"] == code]
-        groups.append({"code": code, "label": glabels.get(code, code), "parcels": int(len(g)),
-                       "ha": round(float(g["surf_ha"].fillna(0).sum()), 1),
-                       "seasons": int(known.loc[known["code_group"] == code, "season"].nunique()),
-                       "status": None if g.empty else ("declared" if (g["crop_status"] == "declared").all()
-                                                       else "assumed")})
-    groups.sort(key=lambda g: (-g["ha"], -g["seasons"]))
-    unknown = int((_in_area(df, area) & (df["season"] == season) & (df["crop_status"] == "unknown")).sum())
+    for code in sorted({r["code_group"] for r in known}):
+        cur = next((r for r in known if r["code_group"] == code and r["season"] == season), None)
+        groups.append({"code": code, "label": glabels.get(code, code), "parcels": cur["parcels"] if cur else 0,
+                       "ha": round(cur["ha"], 1) if cur else 0.0,
+                       "seasons": sum(1 for r in known if r["code_group"] == code),
+                       "status": cur["status"] if cur else None})
+    groups.sort(key=lambda g: (-g["ha"], -g["seasons"], g["code"]))
+    unknown = sum(r["parcels"] for r in rows if not r["code_group"] and r["season"] == season)
     return {"site": site, "area": area, "index": index, "seasons": seasons, "rpg_years": years_rpg,
             "latest_rpg": max(years_rpg), **_season_info(season), "groups": groups, "parcels_unknown_crop": unknown,
             "permanent_groups": sorted(pc.PERMANENT_GROUPS, key=int), "min_clear": settings.s2_parcel_min_clear}
@@ -231,7 +226,8 @@ def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, 
     """
     if weight not in ("pixels", "parcel"):
         raise HTTPException(422, "weight must be pixels or parcel")
-    site, df, mat = _curves(index)
+    _check_index(index)
+    site = _site()
     area = area or site
     by_season = pc.group_curves(site, index, area, group, weighted=weight == "pixels")
     ref_area = ref_area or area
@@ -261,22 +257,26 @@ def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, 
                       "q75": pc.nan_list(cur["q75"]), "count": [int(c) for c in cur["count"]],
                       "parcels": cur["parcels"], "ha": round(cur["ha"], 1), "status": cur["status"]}
     out["comparison"] = pc.compare(cur["mean"], refs, means, season)
-    # Observations: per date, mean of the group's clear parcels
-    sel = df[(df["season"] == season) & (df["code_group"] == group) & (df["crop_status"] != "unknown")
-             & _in_area(df, area)]
+    # Observations: per date, mean of the group's clear parcels (those with a curve this season)
     gy = pc.geometry_year(season, years_rpg)
     with connect() as conn:
         rows = conn.execute(
-            f"""SELECT date, {"sum(mean * n_pixels) / sum(n_pixels)" if weight == "pixels" else "avg(mean)"} AS mean,
-                      count(*) AS n
-               FROM eo.parcel_stats
-               WHERE site = %s AND index = %s AND rpg_year = %s AND date BETWEEN %s AND %s
-                 AND n_clear >= %s * n_pixels AND parcel_id = ANY(%s)
-               GROUP BY date ORDER BY date""",
-            (site, index, gy, pc.season_start(season), pc.season_end(season), settings.s2_parcel_min_clear,
-             list(sel["parcel_id"])),
+            f"""SELECT s.date, {"sum(s.mean * s.n_pixels) / sum(s.n_pixels)" if weight == "pixels" else "avg(s.mean)"}
+                      AS mean, count(*) AS n
+               FROM eo.parcel_stats s
+               JOIN eo.parcel_season c ON c.site = s.site AND c.season = %(season)s AND c.index = s.index
+                                      AND c.parcel_id = s.parcel_id AND c.rpg_year = s.rpg_year
+               JOIN eo.parcel_info i ON i.site = s.site AND i.rpg_year = s.rpg_year AND i.parcel_id = s.parcel_id
+               WHERE s.site = %(site)s AND s.index = %(index)s AND s.rpg_year = %(gy)s
+                 AND s.date BETWEEN %(d0)s AND %(d1)s AND s.n_clear >= %(min_clear)s * s.n_pixels
+                 AND i.code_group = %(group)s AND %(area)s = ANY(i.areas)
+                 AND (i.rpg_year = %(season)s OR i.code_group = ANY(%(permanent)s))
+               GROUP BY s.date ORDER BY s.date""",
+            {"site": site, "index": index, "gy": gy, "season": season, "group": group, "area": area,
+             "d0": pc.season_start(season), "d1": pc.season_end(season), "min_clear": settings.s2_parcel_min_clear,
+             "permanent": sorted(pc.PERMANENT_GROUPS)},
         ).fetchall()
-    need = max(1, min(3, round(0.3 * len(sel))))
+    need = max(1, min(3, round(0.3 * cur["parcels"])))
     out["observations"] = [{"date": str(r["date"]), "day": pc.day_of_season(r["date"], season),
                             "mean": round(float(r["mean"]), 3), "parcels": r["n"]}
                            for r in rows if r["n"] >= need]
@@ -288,27 +288,44 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
     """History of the parcel at a point: for each season, the RPG parcel there, its crop and curve
     metrics; for the selected season, its curve, observations and outline, and the mean of its own
     earlier seasons with the same crop group."""
+    import datetime as dt
     import json
 
-    site, df, mat = _curves(index)
+    _check_index(index)
+    site = _site()
     with connect() as conn:
         crops_l, glabels = _crop_labels(conn)
         years_rpg = pc.rpg_years(conn)
+        all_seasons = [r["season"] for r in conn.execute(
+            "SELECT DISTINCT season FROM eo.parcel_season WHERE site = %s AND index = %s ORDER BY 1",
+            (site, index)).fetchall()]
         found = {r["year"]: r for r in conn.execute(
             """SELECT DISTINCT ON (year) year, parcel_id, code_cultu, code_group, surf_ha, bio,
                       ST_AsGeoJSON(geom, 6) AS g
                FROM ref.rpg_parcel WHERE ST_Intersects(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
                ORDER BY year, surf_ha DESC NULLS LAST""", (lon, lat)).fetchall()}
-    if not found:
-        raise HTTPException(404, "No RPG parcel at this point")
-    history, rows = [], {}
-    for s in sorted(int(x) for x in df["season"].unique()):
+        if not all_seasons:
+            raise HTTPException(404, _NO_SERIES)
+        if not found:
+            raise HTTPException(404, "No RPG parcel at this point")
+        # The curve of each season: that season's RPG parcel at the point
+        wanted = [(s, found[gy]["parcel_id"], gy) for s in all_seasons
+                  if (gy := pc.geometry_year(s, years_rpg)) in found]
+        stored = {r["season"]: r for r in conn.execute(
+            """SELECT c.season, c.n_obs, c.peak, c.peak_date, c.curve, i.areas
+               FROM eo.parcel_season c
+               LEFT JOIN eo.parcel_info i ON i.site = c.site AND i.rpg_year = c.rpg_year AND i.parcel_id = c.parcel_id
+               WHERE c.site = %s AND c.index = %s
+                 AND (c.season, c.parcel_id, c.rpg_year) IN (SELECT * FROM unnest(%s::int[], %s::text[], %s::int[]))""",
+            (site, index, [w[0] for w in wanted], [w[1] for w in wanted], [w[2] for w in wanted])).fetchall()}
+    history, curves = [], {}
+    for s in all_seasons:
         gy = pc.geometry_year(s, years_rpg)
         f = found.get(gy)
         if f is None:
             history.append({"season": s, "rpg_year": gy, "status": "none"})
             continue
-        status = "declared" if s == gy else ("assumed" if f["code_group"] in pc.PERMANENT_GROUPS else "unknown")
+        status = pc.crop_status(s, gy, f["code_group"])
         known = status != "unknown"
         e = {"season": s, "rpg_year": gy, "parcel_id": f["parcel_id"], "status": status,
              "code_cultu": f["code_cultu"] if known else None,
@@ -316,20 +333,17 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
              "code_group": f["code_group"] if known else None,
              "group_label": glabels.get(f["code_group"]) if known else None,
              "last_known_group": f["code_group"], "surf_ha": f["surf_ha"], "bio": f["bio"]}
-        hit = df.index[(df["season"] == s) & (df["parcel_id"] == f["parcel_id"]) & (df["rpg_year"] == gy)]
-        if len(hit):
-            r = df.loc[hit[0]]
-            rows[s] = int(hit[0])
-            e |= {"n_obs": int(r["n_obs"]), "peak": None if pd.isna(r["peak"]) else round(float(r["peak"]), 3),
-                  "peak_date": None if pd.isna(r["peak_date"]) else str(r["peak_date"]),
-                  "areas": sorted(r["areas"])}
+        r = stored.get(s)
+        if r is not None:
+            curves[s] = np.frombuffer(r["curve"], dtype="<f4")
+            e |= {"n_obs": int(r["n_obs"]), "peak": None if r["peak"] is None else round(float(r["peak"]), 3),
+                  "peak_date": None if r["peak_date"] is None else str(r["peak_date"]),
+                  "areas": sorted(r["areas"] or [])}
         history.append(e)
-    if not rows:
+    if not curves:
         raise HTTPException(404, "No clear observation of this parcel")
-    import datetime as dt
-
     this_year = dt.date.today().year      # default: the season harvested this year
-    season = season if season in rows else (this_year if this_year in rows else max(rows))
+    season = season if season in curves else (this_year if this_year in curves else max(curves))
     sel = next(e for e in history if e["season"] == season)
     gy = sel["rpg_year"]
     with connect() as conn:
@@ -340,11 +354,11 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
             (site, index, gy, sel["parcel_id"], pc.season_start(season), pc.season_end(season))).fetchall()
     group = sel["code_group"] or sel["last_known_group"]
     by_season = {e["season"]: e for e in history}
-    own = {s: mat[i] for s, i in rows.items() if s < season and by_season[s].get("code_group") == group}
+    own = {s: c for s, c in curves.items() if s < season and by_season[s].get("code_group") == group}
     out = {"site": site, "index": index, "point": [lon, lat], **_season_info(season),
            "min_clear": settings.s2_parcel_min_clear, "history": history, "parcel": sel,
            "reference_group": group, "reference_group_label": glabels.get(group, group),
-           "geometry": json.loads(found[gy]["g"]), "curve": pc.nan_list(mat[rows[season]]),
+           "geometry": json.loads(found[gy]["g"]), "curve": pc.nan_list(curves[season]),
            "observations": [{"date": str(o["date"]), "day": pc.day_of_season(o["date"], season),
                              "mean": round(float(o["mean"]), 3), "std": round(float(o["std"] or 0), 3),
                              "clear_fraction": round(o["n_clear"] / o["n_pixels"], 3),

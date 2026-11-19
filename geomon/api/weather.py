@@ -11,24 +11,9 @@ from fastapi import APIRouter, HTTPException
 from .. import normals as nm
 from .. import weather as w
 from ..config import settings
-from ..db import connect
+from .areas import get_area as _area
 
 router = APIRouter(prefix="/api/weather", tags=["weather"])
-
-
-
-def _area(area: str | None) -> dict:
-    """Outline of an AOI area: the group (site) by default, or one of its communes."""
-    with connect() as conn:
-        row = conn.execute(
-            """SELECT code, name, kind, ST_AsGeoJSON(geom) AS geojson FROM meta.aoi
-               WHERE site = %(s)s AND ((%(a)s::text IS NULL AND kind = 'site') OR code = %(a)s)
-               ORDER BY (kind = 'site') DESC, updated_at DESC LIMIT 1""",
-            {"a": area or None, "s": settings.site_code},
-        ).fetchone()
-    if not row:
-        raise HTTPException(404, f"Unknown area {area}" if area else "No AOI yet")
-    return {"code": row["code"], "name": row["name"], "kind": row["kind"], "geometry": json.loads(row["geojson"])}
 
 
 def _area_info(region: dict | None) -> dict | None:
@@ -104,7 +89,7 @@ def cells(product: str) -> dict:
 
 @router.get("/daily")
 def daily(var: str, lon: float | None = None, lat: float | None = None, area: str | None = None,
-          series: str = "mf,era5land,agera5,sim2",
+          series: str = "mf,era5land,era5,agera5,sim2",
           start: str | None = None, end: str | None = None, step: str = "day") -> dict:
     """Daily (or weekly/monthly) values of one variable, for several series.
 
@@ -113,7 +98,7 @@ def daily(var: str, lon: float | None = None, lat: float | None = None, area: st
     group when neither is given), each grid cell weighted by its overlap.
 
     ``series``: comma-separated keys among mf (Météo-France history + forecast),
-    era5land and sim2. Weekly and monthly values are sums for accumulations and
+    era5land, era5, agera5 and sim2. Weekly and monthly values are sums for accumulations and
     means otherwise; incomplete periods of sums are left empty.
     """
     if var not in w.DAILY:

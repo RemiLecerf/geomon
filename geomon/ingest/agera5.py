@@ -38,10 +38,9 @@ import xarray as xr
 
 from ..aoi import AOI
 from ..config import settings
-from ..http import session
 from ..units import registry
-from ..weather import PRODUCTS, store_path
-from .openmeteo import _write
+from ..weather import PRODUCTS, store_path, write_product
+from .cds import available_until, retrieve
 
 log = logging.getLogger(__name__)
 
@@ -123,20 +122,6 @@ def _convert(values: np.ndarray, src: str, dst: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Request
 # ---------------------------------------------------------------------------
-def _available_until() -> dt.date:
-    """Last date published: the end of the date range offered by the request form."""
-    s = session()
-    r = s.get(f"{settings.cds_api_url}/catalogue/v1/collections/{DATASET}", timeout=60)
-    r.raise_for_status()
-    coll = r.json()
-    form_url = next(l["href"] for l in coll["links"] if l.get("rel") == "form")
-    form = s.get(form_url, timeout=60).json()
-    for w in form:
-        if w.get("name") == "date" and w.get("details", {}).get("maxEnd"):
-            return dt.date.fromisoformat(w["details"]["maxEnd"][:10])
-    return dt.date.fromisoformat(coll["extent"]["temporal"]["interval"][0][1][:10])
-
-
 def _area(aoi: AOI) -> list[float]:
     """[N, W, S, E] covering every 0.1° cell that touches the AOI extent."""
     x0, y0, x1, y1 = aoi.bbox_wgs84
@@ -146,27 +131,6 @@ def _area(aoi: AOI) -> list[float]:
 def _request(area: list[float], start: dt.date, end: dt.date) -> dict:
     return {"variable": [f.request for f in FIELDS], "area": area,
             "date": [f"{start.isoformat()}/{end.isoformat()}"], "data_format": "netcdf"}
-
-
-def _retrieve(request: dict, target: Path) -> None:
-    import cdsapi  # imported here: only this step needs it
-
-    client = cdsapi.Client(url=settings.cds_api_url, key=settings.cds_api_key, quiet=True, progress=False,
-                           retry_max=3, sleep_max=60)
-    try:
-        client.retrieve(DATASET, request, str(target))
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "licen" in msg:
-            raise RuntimeError(
-                "The AgERA5 licence is not accepted for this CDS account: open "
-                f"https://cds.climate.copernicus.eu/datasets/{DATASET}?tab=download and accept it") from exc
-        if "queued requests" in msg:
-            raise RuntimeError(
-                "The CDS already has the maximum number of queued requests for this dataset on this account. "
-                "Wait for them to finish (or cancel them at https://cds.climate.copernicus.eu/requests) "
-                "and run the step again") from exc
-        raise
 
 
 # ---------------------------------------------------------------------------
@@ -277,9 +241,7 @@ def _download(area: list[float], start: dt.date, until: dt.date, folder: Path) -
     raw = folder / f"agera5_{start}_{until}.nc"
     log.info("AgERA5 %s to %s, area %s, %d variables: one CDS request (it may wait in the CDS queue)",
              start, until, area, len(FIELDS))
-    part = raw.with_suffix(".part")
-    _retrieve(request, part)
-    part.replace(raw)
+    retrieve(DATASET, request, raw)
     (folder / "request.json").write_text(json.dumps(request, indent=1))
     return raw
 
@@ -314,7 +276,7 @@ def run(aoi: AOI) -> dict:
     if not settings.cds_api_key:
         log.warning("GEOMON_CDS_API_KEY is not set: AgERA5 skipped (free Copernicus account needed)")
         return {"skipped": "GEOMON_CDS_API_KEY not set"}
-    start, until, area = max(settings.agera5_start, dt.date(1979, 1, 1)), _available_until(), _area(aoi)
+    start, until, area = max(settings.agera5_start, dt.date(1979, 1, 1)), available_until(DATASET), _area(aoi)
     folder = settings.raw_dir / "agera5" / aoi.code
     folder.mkdir(parents=True, exist_ok=True)
     store = _stored(area, start)
@@ -350,6 +312,6 @@ def run(aoi: AOI) -> dict:
         ds.attrs = new.attrs
     ds.attrs |= {"start": str(ds.time.values[0])[:10], "end": str(ds.time.values[-1])[:10],
                  "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
-    _write(ds, "agera5")
+    write_product(ds, "agera5")
     return {"cells": int(ds.sizes["point"]), "start": ds.attrs["start"], "end": ds.attrs["end"],
             "new_days": added, "variables": len(ds.data_vars), "missing": missing}

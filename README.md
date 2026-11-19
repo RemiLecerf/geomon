@@ -9,12 +9,13 @@ web map. See [Specifications.md](Specifications.md) for the full project.
 | Administrative hierarchy: commune (+ neighbours), EPCI, arrondissement, département, région, France | IGN ADMIN EXPRESS COG 2026 (Géoplateforme WFS) | PostGIS `ref.admin_unit`, with validity dates |
 | Agricultural parcels, RPG 2015–2025 (every year: crop history of each parcel) | IGN Géoplateforme WFS (`RPG.LATEST` for the latest year, checked at download; `RPG.<year>` before) | PostGIS `ref.rpg_parcel`, `ref.rpg_crop_code` |
 | OpenStreetMap: roads, buildings, land use, water, waterways, railways, POIs | Overpass API, one query over the AOI extent (Geofabrik extracts optional, for later) | PostGIS `ref.osm_feature`. Raw response kept in `data/raw/osm` |
-| Elevation model, 5 m, plus slope and aspect | IGN RGE ALTI (Géoplateforme WMS-R) | Zarr `data/zarr/dem.zarr` |
+| Elevation model, 5 m, plus slope and aspect | IGN RGE ALTI (Géoplateforme WMS-R) | Zarr `data/zarr/sites/<site>/dem.zarr`, overviews `dem_ov4`, `dem_ov16`, `dem_ov64` |
 | Soil, 6 layers down to 2 m | ISRIC SoilGrids 2.0 (250 m) | Zarr `data/zarr/soil.zarr` |
 | Derived soil hydraulics: water content at field capacity, wilting point and saturation, saturated conductivity (Ksat), available water capacity (AWC), USDA texture class | Saxton & Rawls (2006) pedotransfer functions | Zarr `data/zarr/soil.zarr` |
 | Satellite, Sentinel-2 L2A (Sen2Cor atmospheric correction), since 2015-06-27, 10 m: bands B04 and B08 (NDVI) plus the scene classification (SCL); more bands on demand (B05 for NDRE, …) | Copernicus Data Space, through openEO (free account) | Zarr `data/zarr/sentinel2/<site>/<year>.zarr`; per-date index statistics per area in `eo.index_stats`, per RPG parcel in `eo.parcel_stats`, smoothed parcel-season curves in `eo.parcel_season` |
 | Weather, hourly: Météo-France AROME/ARPEGE archived forecasts (from 2022-11-13) and the latest forecast (AROME/ARPEGE to ~4 days, then ECMWF IFS to 15 days) | Open-Meteo (free, non-commercial use) | Zarr `data/zarr/weather/om_mf_hist.zarr`, `om_forecast.zarr` |
-| Reanalysis, hourly: ERA5-Land 0.1° (soil temperature and moisture, snow), ERA5 0.25° for rain, wind, radiation, ET0 | Open-Meteo (Copernicus) | Zarr `data/zarr/weather/om_era5land.zarr` |
+| Reanalysis, hourly: ERA5-Land 0.1° (core weather, snow, soil temperature and moisture in 4 layers) | Copernicus CDS, `reanalysis-era5-land-timeseries` (free account, CC-BY 4.0); Open-Meteo as an option | Zarr `data/zarr/sites/<site>/weather/era5land.zarr` |
+| Reanalysis, hourly: ERA5 0.25° (core weather, plus cloud cover, boundary-layer height, gusts, 100 m wind, surface heat fluxes and the actual evapotranspiration derived from them) | Copernicus CDS, `reanalysis-era5-single-levels-timeseries` | Zarr `data/zarr/sites/<site>/weather/era5.zarr` |
 | Agrometeorological indicators, daily, since 1979: AgERA5, 0.1° (ERA5 aggregated to local days and corrected to the 0.1° topography), about 10 days behind | Copernicus CDS (free account, CC-BY 4.0) | Zarr `data/zarr/weather/agera5.zarr`. Download of the AOI box in `data/raw/agera5` |
 | Reanalysis, daily: SAFRAN-ISBA (SIM2), 8 km, since 1990 (for the 1991–2020 normals), with ETP, soil wetness index, drainage, snow | Météo-France open data (meteo.data.gouv.fr) | Zarr `data/zarr/weather/sim2.zarr`. Only the AOI cells are kept, in `data/raw/sim2` |
 | Descriptive statistics: population, households, dwellings, employment, income | INSEE Melodi API, for the commune, EPCI, département, région and France | PostgreSQL `stats.*`, with units and geography vintage |
@@ -37,8 +38,17 @@ Open **http://localhost:8088**.
 To re-run one step:
 
 ```bash
-docker compose run --rm ingest rpg         # steps: admin rpg osm dem soil insee weather sim2 agera5 sentinel2 forecast (or all)
-curl -X POST http://localhost:8088/api/reload   # after re-running dem or soil, reload the rasters
+docker compose run --rm ingest rpg         # steps: admin rpg osm dem soil insee weather era5land era5 sim2 agera5 sentinel2 forecast (or all)
+```
+
+The web app picks up re-ingested data by itself (its caches follow the stores' modification times).
+The `osm` step runs for one site at a time, even from several terminals (Overpass asks for no
+parallel queries).
+
+Unit tests (no database, network or data needed; they run on the working copy, without rebuilding):
+
+```bash
+docker compose run --rm test
 ```
 
 Everyday commands:
@@ -65,9 +75,10 @@ source when it publishes, and only downloads what is new:
 | Job | Published | Checked | Step |
 |---|---|---|---|
 | Forecast | AROME every 3 h, ARPEGE and ECMWF IFS every 6 h | every 15 min, from Open-Meteo's model run times; at most one download every 3 h (`GEOMON_FORECAST_MIN_HOURS`) | `forecast` |
-| Météo-France archive, ERA5-Land / ERA5 | daily | daily at 02:00 UTC | `weather` |
+| Météo-France archive | daily | daily at 02:00 UTC | `weather` |
 | SIM2 | daily ("latest" file) | every 6 h | `sim2` |
 | AgERA5 | daily, ~10 days behind | every 6 h | `agera5` |
+| ERA5-Land, ERA5 | daily, ~10 days behind | every 6 h | `era5land`, `era5` |
 | Sentinel-2 | each scene, ~5 h after acquisition | every 3 h, from the Copernicus STAC catalogue (no openEO credits) | `sentinel2` |
 
 One scheduler serves every site: each job checks its source once (one look at the forecast models' run
@@ -79,25 +90,36 @@ Open-Meteo daily quota, the CDS queue) does not hold up the others.
 A site whose update failed is retried alone after 30 minutes; a site added to `sites.json` is brought up
 to date at once; a job missed while the computer was off runs at the next start.
 `docker compose exec scheduler python -m geomon.scheduler --status` shows the last runs; `docker compose logs -f
-scheduler` follows them. Steps can still be run by hand (`ingest forecast`, `ingest weather sim2 agera5`): a
+scheduler` follows them. Steps can still be run by hand (`ingest forecast`, `ingest weather era5land era5 sim2 agera5`): a
 database lock makes a manual run wait for a scheduled one, so they never write the same data at once.
 
-AgERA5 needs a free Copernicus account: put the personal access token
+AgERA5, ERA5-Land and ERA5 need a free Copernicus account: put the personal access token
 (https://cds.climate.copernicus.eu/profile) in `GEOMON_CDS_API_KEY` in `.env`, and accept the
-licence once on the dataset's Download tab. Without a token the step is skipped. The CDS queues
+licence once on each dataset's Download tab. Without a token the steps are skipped. For AgERA5 the CDS queues
 requests: the first run sends a single request (all variables, the whole history since 1979, AOI box), which can wait
 from minutes to an hour in the queue. Later runs only ask for the days published since (plus the last 10
 again) and append them to the store; nothing is requested when no new day has been published.
 
+ERA5-Land (0.1°) and ERA5 (0.25°) come from the CDS time-series editions, which serve an area and a
+period in one request: the first run asks for one year per request (from `GEOMON_WEATHER_START`, or
+`GEOMON_ERA5_START` for ERA5: `1990-01-01` gives ERA5 1991–2020 normals), kept in `data/raw/era5land` and
+`data/raw/era5` so that an interrupted run resumes; later runs ask for the days published since, plus the
+last 3 again. Only the cells touching the site's communes are kept. Both are first published as preliminary
+data (ERA5T), replaced by the final release 2–3 months later: once a week the last 92 days are fetched
+again (`GEOMON_ERA5_REVISION_DAYS`, `GEOMON_ERA5_REVISION_EVERY_DAYS`). Variables carry the names and units
+of the Open-Meteo products; relative humidity, wind speed and ET0 (FAO-56 hourly Penman-Monteith, with the
+reanalysis' own long-wave radiation) are computed, and ERA5's actual evapotranspiration comes from its latent
+heat flux. ERA5-Land re-runs ERA5's land model at 0.1°: it is the one for soil and snow; ERA5 adds the
+atmosphere (cloud cover, boundary layer, gusts, heat fluxes) and a record back to 1940.
+
+`GEOMON_ERA5_SOURCE=openmeteo` brings back the former source: ERA5-Land completed with ERA5 in one product
+(`om_era5land`), fetched by the `weather` step within Open-Meteo's daily quota (then no separate ERA5).
+
 The Météo-France archive at Open-Meteo is slow (1–3 min per month for all points): the first run takes
 about 2 hours. Fetched months are kept in `data/raw/openmeteo`, so an interrupted run resumes. Later runs
 only ask for the days since the last run, plus the last 3 again (`GEOMON_WEATHER_OVERLAP_DAYS`, as the
-archives fill in late), rather than the whole current month (Météo-France) or year (ERA5-Land): for
-ERA5-Land this divides the daily quota used by about 20. ERA5-Land is first published as preliminary
-data (ERA5T), replaced by the final release 2–3 months later: once a week the last 92 days are fetched
-again so that these corrections reach the store (`GEOMON_ERA5_REVISION_DAYS`,
-`GEOMON_ERA5_REVISION_EVERY_DAYS`; about 300 quota calls for both sites). The store keeps what is already assembled:
-only the new days are parsed and appended, and nothing is written when nothing changed.
+archives fill in late). The store keeps what is already assembled: only the new days are parsed and
+appended, and nothing is written when nothing changed.
 
 Open-Meteo's free quota (10,000 calls a day) counts each grid point of a request as one call, weighted by
 the number of variables and days. Only the points whose cell touches one of the site's communes are
@@ -204,6 +226,37 @@ optionally, a `farm_file` and `farm_name` (see "The farm's plots"; leave them ou
   `data/zarr/sentinel2/<code>/`; database rows carry the site code. Without `sites.json`, the single site
   of `GEOMON_COMMUNES` is used as before.
 
+#### A whole administrative unit (a département: NUTS-3)
+
+Instead of `communes`, a site can take every commune of an administrative unit: `"unit": "DEP:50"` (a
+département), `EPCI:<SIREN code>`, `ARR:<code>` or `REG:<code>` (`GEOMON_UNIT` for a single site). The
+communes are listed from IGN ADMIN EXPRESS at each ingestion, and the name defaults to the unit's:
+
+```json
+{"code": "manche", "unit": "DEP:50"}
+```
+
+What changes with the size of the site (a département is ~5,700 km² and ~360 communes, against tens of km²):
+
+- **Web page:** the Area menu groups the communes by intercommunality; the hierarchy lists the parent units.
+- **Sentinel-2:** the statistics of every commune come from one label image per part, not one mask each
+  (0.5 GB instead of 20 GB for a département); about 7 s per date for 360 communes. The images themselves
+  grow with the area: plan about 150 GB and the openEO credits for 11 years of a département.
+- **Crop groups:** their curves per area and season are computed at ingestion (`eo.group_season`, from
+  `eo.parcel_info`: each parcel's crop and areas); the web page reads a few rows.
+- **Weather:** daily values are computed once per update into a daily store beside each hourly archive
+  (`<product>_daily.zarr`); the web app reads it, and the hourly store only around the forecast start.
+  The Météo-France grid doubles its step until the site has at most `GEOMON_WEATHER_MAX_POINTS` (150)
+  points: a département gets about 0.1° (each point samples the AROME cell under it), which keeps a
+  forecast near 800 of Open-Meteo's 10,000 daily calls. Requests carry at most
+  `GEOMON_OPENMETEO_BATCH_POINTS` (100) points. The quota is shared by all the sites of a server.
+- **Elevation:** the 5 m grid is downloaded and written in strips (a département has over a billion cells),
+  with overviews at 20, 80 and 320 m (`dem_ov4`, `dem_ov16`, `dem_ov64`). The map reads only the cells of
+  each tile, from the overview matching the zoom; the land summary of a large area uses an overview.
+- **Not changed yet:** INSEE statistics are fetched commune by commune (~2,000 requests for a département);
+  OpenStreetMap for a département is beyond what Overpass accepts in one query: use
+  `GEOMON_OSM_SOURCE=geofabrik`.
+
 ### The farm's plots
 
 `farm_file` in `sites.json` (or `GEOMON_FARM_FILE` for a single site; optional) points to a GeoJSON of
@@ -259,7 +312,7 @@ Every tab follows it; the selected area is outlined in red on the map.
   tables with labelled dimensions.
 - **Weather:** daily, weekly or monthly series of any variable, averaged over the selected area (or at
   a point clicked on the map), comparing
-  Météo-France, ERA5-Land, AgERA5 and SIM2: the AgERA5 set (temperature min/mean/max, precipitation, radiation,
+  Météo-France, ERA5-Land, ERA5, AgERA5 and SIM2: the AgERA5 set (temperature min/mean/max, precipitation, radiation,
   humidity at 06–18 h, vapour pressure, wind, snow), plus ET0, soil moisture and temperature, and the SIM2
   soil wetness index and drainage. The forecast is shaded; a table gives the mean difference and
   correlation with SIM2; a second table gives the daily forecast. Click the map for a point; the
@@ -293,12 +346,14 @@ Every tab follows it; the selected area is outlined in red on the map.
 | `GET /api/rpg.geojson`, `GET /api/rpg/summary?area=` | RPG parcels, crop areas in an area |
 | `GET /api/farm.geojson` | The farm's plots, with the latest RPG crop of each |
 | `GET /api/osm/{roads,buildings,landuse,water,waterways,railways,pois}.geojson` | OSM layers |
+| `GET /api/tiles/{rpg,roads,buildings,landuse,water,waterways,railways,pois}/{z}/{x}/{y}.pbf` | Vector tiles of the large layers (what the map uses) |
 | `GET /api/rasters` | Raster catalogue: variables, units, depths |
-| `GET /api/raster/{dem,soil}/{var}.png?depth=i`, `…/info` | Rendered overlay and its legend |
+| `GET /api/raster/{dem,soil}/{var}/info?depth=i` | Legend, extent and tile URL of an overlay |
+| `GET /api/raster/{dem,soil}/{var}/tiles/{z}/{x}/{y}.png?depth=i` | Overlay tiles (what the map uses); `…/{var}.png`: the whole overlay as one image |
 | `GET /api/point?lon=&lat=` | Every layer at a point |
 | `GET /api/stats/datasets`, `summary`, `series`, `table` (`level=GRP&code=<site>` for the group) | Statistics |
 | `GET /api/weather/products` | Weather products, periods, variables and units |
-| `GET /api/weather/daily?area=&var=t_max&series=mf,era5land,agera5,sim2&step=day` | Daily, weekly or monthly series over an area (or `lon=&lat=` for a point) |
+| `GET /api/weather/daily?area=&var=t_max&series=mf,era5land,era5,agera5,sim2&step=day` | Daily, weekly or monthly series over an area (or `lon=&lat=` for a point) |
 | `GET /api/weather/normals?area=&var=precip&series=sim2&start=2026-01-01` | One year against the 1991–2020 normal of the same source (`sim2` or `agera5`), continued by the Météo-France archive and forecast (`forecast=false` to leave them out) |
 | `GET /api/weather/forecast?area=` | Daily summary of the latest forecast over an area (or at a point) |
 | `GET /api/weather/cells.geojson?product=sim2` | Grid cells of a product |
@@ -319,18 +374,22 @@ Interactive documentation: http://localhost:8088/docs. The database is reachable
 ```
 docker-compose.yml          db (PostGIS 18), api (web app), ingest (one-shot data loading)
 docker/geomon/Dockerfile    Debian testing + GDAL + Python geospatial stack
-db/init/01_schema.sql       schemas ref, stats, meta, staging
+db/init/01_schema.sql       PostGIS and hstore extensions (run once, when the cluster is created)
 geomon/
+  schema.sql                every table (schemas ref, stats, meta, eo, staging)
+  migrate.py                creates or upgrades the schema when a process starts (versioned)
   config.py                 settings from environment variables
   aoi.py                    area of interest: one commune or a group (outlines, buffered extent)
   units.py                  unit conversion helper (pint)
+  zarrio.py                 atomic Zarr writes (the web app never reads a half-written store)
   weather.py                weather products: loading, AgERA5-style daily aggregation
   scheduler.py              keeps the weather and Sentinel-2 up to date (compose service "scheduler")
   sentinel2.py              Sentinel-2 stores, cloud mask (SCL), spectral indices, area statistics
   parcels.py                index series per RPG parcel, smoothed season curves, crop-group references
-  ingest/                   one module per source: admin, rpg, osm, dem, soil, insee, openmeteo, sim2, agera5, sentinel2
-  api/                      FastAPI app, raster rendering and point sampling
+  ingest/                   one module per source: admin, rpg, osm, dem, soil, insee, openmeteo, era5 (ERA5-Land and ERA5), sim2, agera5, sentinel2
+  api/                      FastAPI app, vector and raster tiles, point sampling
 web/                        static page (MapLibre GL JS, no build step)
+tests/                      unit tests (docker compose run --rm test)
 ```
 
 ## Known limitations

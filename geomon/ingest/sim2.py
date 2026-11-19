@@ -20,7 +20,6 @@ import hashlib
 import io
 import json
 import logging
-import shutil
 
 import numpy as np
 import pandas as pd
@@ -30,7 +29,7 @@ from pyproj import Transformer
 from ..aoi import AOI
 from ..config import all_sites, settings
 from ..http import session
-from ..weather import PRODUCTS, clear_cache, store_path
+from ..weather import PRODUCTS, store_path, write_product
 
 log = logging.getLogger(__name__)
 
@@ -241,10 +240,5 @@ def run(aoi: AOI) -> dict:
             "license": "Licence Ouverte Etalab 2.0, Météo-France",
         },
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        shutil.rmtree(path)
-    ds.to_zarr(path, mode="w", consolidated=True)
-    clear_cache()
-    log.info("Wrote %s: %d cells, %s to %s", path.name, len(cells), ds.attrs["start"], ds.attrs["end"])
+    write_product(ds, "sim2")
     return {"cells": len(cells), "start": ds.attrs["start"], "end": ds.attrs["end"], "days": len(times)}

@@ -18,7 +18,7 @@ from ..aoi import resolve_aoi, save_aoi
 from ..config import all_sites, settings, use_site
 from ..db import connect
 from .lock import ingest_lock, lock_group
-from . import admin, agera5, dem, farm, insee, openmeteo, osm, rpg, sentinel2, sim2, soil
+from . import admin, agera5, dem, era5, farm, insee, openmeteo, osm, rpg, sentinel2, sim2, soil
 
 STEPS = {
     "admin": admin.run,
@@ -28,7 +28,9 @@ STEPS = {
     "dem": dem.run,
     "soil": soil.run,
     "insee": insee.run,
-    "weather": openmeteo.run_history,   # Open-Meteo: Météo-France archived forecasts, ERA5-Land
+    "weather": openmeteo.run_history,   # Open-Meteo: Météo-France archived forecasts (+ ERA5-Land if GEOMON_ERA5_SOURCE=openmeteo)
+    "era5land": era5.run_land,          # Copernicus CDS ERA5-Land hourly, 0.1° (needs GEOMON_CDS_API_KEY)
+    "era5": era5.run_era5,              # Copernicus CDS ERA5 hourly, 0.25° (needs GEOMON_CDS_API_KEY)
     "sim2": sim2.run,                   # Météo-France SAFRAN-ISBA daily reanalysis
     "agera5": agera5.run,               # Copernicus AgERA5 (needs GEOMON_CDS_API_KEY)
     "sentinel2": sentinel2.run,         # Sentinel-2 L2A via openEO (needs sentinel2-login once)

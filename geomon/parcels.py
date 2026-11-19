@@ -40,7 +40,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
-from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -68,43 +67,7 @@ LAMBDA = 100                 # Whittaker smoothing (daily grid, 2nd differences)
 PERMANENT_GROUPS = {"17", "18", "20", "21", "22", "23"}
 # Peak of the season's crop: 1 January to 31 August (later, the next crop may have been sown)
 PEAK_DAYS = (JAN1, JAN1 + 243)
-
-SCHEMA = """
-CREATE SCHEMA IF NOT EXISTS eo;
-CREATE TABLE IF NOT EXISTS eo.parcel_stats (
-    site       text NOT NULL,
-    rpg_year   int  NOT NULL,          -- RPG year of the parcel outline
-    parcel_id  text NOT NULL,          -- RPG id_parcel (unique within a year only)
-    index      text NOT NULL,
-    date       date NOT NULL,
-    mean       real,
-    std        real,
-    n_pixels   int,                    -- interior pixels (outline shrunk by 10 m)
-    n_clear    int,                    -- clear interior pixels with a valid index
-    PRIMARY KEY (site, rpg_year, index, parcel_id, date)
-);
-CREATE TABLE IF NOT EXISTS eo.parcel_dates (     -- parcel-dates processed (also when no parcel was clear)
-    site text NOT NULL, rpg_year int NOT NULL, index text NOT NULL, date date NOT NULL,
-    PRIMARY KEY (site, rpg_year, index, date)
-);
-CREATE TABLE IF NOT EXISTS eo.parcel_season (
-    site        text NOT NULL,
-    season      int  NOT NULL,         -- RPG year of the crop (1 Sept season-1 .. 31 Dec season)
-    index       text NOT NULL,
-    parcel_id   text NOT NULL,
-    rpg_year    int  NOT NULL,         -- outline used (the season's RPG, or the latest one)
-    n_obs       int,
-    first_obs   date,
-    last_obs    date,
-    peak        real,
-    peak_date   date,
-    curve       bytea,                 -- float32 little-endian, SEASON_DAYS values, NaN when empty
-    n_pixels    int,                   -- interior pixels of the parcel (weight in the group means)
-    computed_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (site, season, index, parcel_id)
-);
-ALTER TABLE eo.parcel_season ADD COLUMN IF NOT EXISTS n_pixels int;
-"""
+# Tables: eo.parcel_stats, eo.parcel_dates, eo.parcel_season (geomon/schema.sql)
 
 
 # ---------------------------------------------------------------------------
@@ -374,13 +337,12 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
     years_rpg = rpg_years()
     if not years_rpg:
         return 0
-    with connect() as conn:
-        conn.execute(SCHEMA)
-        if seasons is None:
+    if seasons is None:
+        with connect() as conn:
             first = conn.execute("SELECT min(date) AS d FROM eo.parcel_dates WHERE site = %s", (site,)).fetchone()["d"]
-            if first is None:
-                return 0
-            seasons = set(range(first.year, max(current_seasons()) + 1))
+        if first is None:
+            return 0
+        seasons = set(range(first.year, max(current_seasons()) + 1))
     n = 0
     for season in sorted(seasons):
         gy = geometry_year(season, years_rpg)
@@ -432,13 +394,15 @@ def sync(site: str, full: bool = False) -> dict:
 
     Seasons whose RPG outlines changed (a new RPG year loaded) are recomputed as well.
     """
-    with connect() as conn:
-        conn.execute(SCHEMA)
-        if full:
-            for t in ("parcel_stats", "parcel_dates", "parcel_season"):
+    if full:
+        with connect() as conn:
+            for t in ("parcel_stats", "parcel_dates", "parcel_season", "parcel_info", "group_season"):
                 conn.execute(f"DELETE FROM eo.{t} WHERE site = %s", (site,))
     clear_labels()
-    touched = store_missing_stats(site)
+    try:
+        touched = store_missing_stats(site)
+    finally:
+        clear_labels()      # parcel rasters of every RPG year: not kept by the long-running scheduler
     years_rpg = rpg_years()
     with connect() as conn:
         stale = {r["season"] for r in conn.execute(
@@ -448,107 +412,157 @@ def sync(site: str, full: bool = False) -> dict:
             conn.execute("DELETE FROM eo.parcel_season WHERE site = %s AND season = ANY(%s)", (site, list(stale)))
     seasons = None if full else touched | stale
     n = compute_seasons(site, seasons) if (full or seasons) else 0
-    return {"seasons": sorted(seasons) if seasons is not None else "all", "curves": n}
-
-
-# ---------------------------------------------------------------------------
-# 3. Reading: curves, group references
-# ---------------------------------------------------------------------------
-def stamp(site: str) -> str:
+    # Crop-group curves of the seasons recomputed (all of them when none was computed yet)
     with connect() as conn:
-        exists = conn.execute("SELECT to_regclass('eo.parcel_season') AS t").fetchone()["t"]
-        if not exists:
-            return ""
-        r = conn.execute("SELECT max(computed_at) AS m, count(*) AS n FROM eo.parcel_season WHERE site = %s",
-                         (site,)).fetchone()
-    return f"{r['m']}/{r['n']}"
+        backfill = (conn.execute("SELECT 1 FROM eo.parcel_season WHERE site = %s LIMIT 1", (site,)).fetchone()
+                    and not conn.execute("SELECT 1 FROM eo.group_season WHERE site = %s LIMIT 1", (site,)).fetchone())
+    groups = compute_groups(site, None if (full or backfill) else seasons) if (full or seasons or backfill) else 0
+    return {"seasons": sorted(seasons) if seasons is not None else "all", "curves": n, "group_curves": groups}
 
 
-@lru_cache(maxsize=4)
-def curves(site: str, index: str, _stamp: str) -> tuple[pd.DataFrame, np.ndarray]:
-    """Every parcel curve of an index: table (one row per parcel and season, with its crop and areas)
-    and the matrix of curves (rows in the same order)."""
+# ---------------------------------------------------------------------------
+# 3. Crop-group curves per area, computed at ingestion (eo.parcel_info, eo.group_season)
+# ---------------------------------------------------------------------------
+def crop_status(season: int, rpg_year: int, code_group: str | None) -> str:
+    """declared (the season's own RPG), assumed (a permanent crop taken from the latest RPG) or unknown."""
+    if season == rpg_year:
+        return "declared"
+    return "assumed" if code_group in PERMANENT_GROUPS else "unknown"
+
+
+def refresh_parcel_info(site: str, years) -> int:
+    """eo.parcel_info for the given RPG years: each parcel whose point on surface lies in one of the
+    site's areas, with its crop and those areas (point-in-polygon in Python, vectorised: a spatial
+    join in SQL proved fragile on large sites)."""
     import shapely
     from shapely.geometry import shape
 
     with connect() as conn:
-        # One indexed lookup per parcel (year, id), with a point inside it; no spatial join in SQL,
-        # whose plan proved fragile on large sites
-        rows = conn.execute(
-            """SELECT c.season, c.parcel_id, c.rpg_year, c.n_obs, c.n_pixels, c.first_obs, c.last_obs, c.peak,
-                      c.peak_date, c.curve, p.code_group, p.code_cultu, p.surf_ha, p.bio, p.px, p.py
-               FROM eo.parcel_season c
-               JOIN LATERAL (SELECT q.code_group, q.code_cultu, q.surf_ha, q.bio,
-                                    ST_X(ST_PointOnSurface(q.geom)) AS px, ST_Y(ST_PointOnSurface(q.geom)) AS py
-                             FROM ref.rpg_parcel q WHERE q.year = c.rpg_year AND q.parcel_id = c.parcel_id
-                             ORDER BY q.surf_ha DESC NULLS LAST LIMIT 1) p ON true
-               WHERE c.site = %s AND c.index = %s
-               ORDER BY c.season, c.parcel_id""",
-            (site, index),
-        ).fetchall()
-        areas = conn.execute("SELECT code, ST_AsGeoJSON(geom) AS g FROM meta.aoi WHERE site = %s",
-                             (site,)).fetchall()
-    # Areas of each parcel: those containing its point (vectorised)
-    if rows:
-        xs = np.array([r["px"] for r in rows], dtype="float64")
-        ys = np.array([r["py"] for r in rows], dtype="float64")
-        inside = {a["code"]: shapely.contains_xy(shape(json.loads(a["g"])), xs, ys) for a in areas}
-        for i, r in enumerate(rows):
-            r["areas"] = [code for code, m in inside.items() if m[i]]
-    mat = np.stack([np.frombuffer(r["curve"], dtype="<f4") for r in rows]) if rows \
-        else np.zeros((0, SEASON_DAYS), dtype="float32")
-    df = pd.DataFrame([{k: v for k, v in r.items() if k not in ("curve", "px", "py")} for r in rows])
-    if len(df):
-        df["crop_status"] = np.where(df["season"] == df["rpg_year"], "declared",
-                                     np.where(df["code_group"].isin(PERMANENT_GROUPS), "assumed", "unknown"))
-        df["areas"] = df["areas"].apply(lambda a: set(a or []))
-    return df, mat
+        areas = {r["code"]: shape(json.loads(r["g"])) for r in conn.execute(
+            "SELECT code, ST_AsGeoJSON(geom) AS g FROM meta.aoi WHERE site = %s", (site,)).fetchall()}
+    for g in areas.values():
+        shapely.prepare(g)
+    n = 0
+    for gy in sorted(years):
+        with connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT ON (p.parcel_id) p.parcel_id, p.code_group, p.code_cultu, p.surf_ha, p.bio,
+                          ST_X(ST_PointOnSurface(p.geom)) AS px, ST_Y(ST_PointOnSurface(p.geom)) AS py
+                   FROM ref.rpg_parcel p JOIN meta.aoi s ON s.kind = 'site' AND s.code = %s AND p.geom && s.bbox
+                   WHERE p.year = %s ORDER BY p.parcel_id, p.surf_ha DESC NULLS LAST""", (site, gy)).fetchall()
+            xs = np.array([r["px"] for r in rows], dtype="float64")
+            ys = np.array([r["py"] for r in rows], dtype="float64")
+            inside = {code: shapely.contains_xy(g, xs, ys) for code, g in areas.items()} if rows else {}
+            conn.execute("DELETE FROM eo.parcel_info WHERE site = %s AND rpg_year = %s", (site, gy))
+            with conn.cursor() as cur:
+                with cur.copy("COPY eo.parcel_info (site, rpg_year, parcel_id, code_group, code_cultu, surf_ha, bio, "
+                              "areas) FROM STDIN") as cp:
+                    for i, r in enumerate(rows):
+                        codes = [code for code, m in inside.items() if m[i]]
+                        if codes:
+                            cp.write_row((site, gy, r["parcel_id"], r["code_group"], r["code_cultu"], r["surf_ha"],
+                                          r["bio"], codes))
+                            n += 1
+    return n
+
+
+def _group_curve(mat: np.ndarray, w: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Mean weighted by w, plain mean, 25th and 75th percentiles and count, day by day, where at
+    least min(3, rows) rows have a value."""
+    min_n = min(3, len(mat))
+    cnt = np.isfinite(mat).sum(axis=0)
+    with np.errstate(all="ignore"), _quiet():
+        ok = np.isfinite(mat)
+        ww = np.where(ok, w[:, None], 0.0)
+        weighted = (np.where(ok, mat, 0.0) * ww).sum(axis=0) / ww.sum(axis=0)
+        plain = np.nanmean(mat, axis=0)
+        q25, q75 = np.nanpercentile(mat, [25, 75], axis=0)
+    bad = cnt < min_n
+    for a in (weighted, plain, q25, q75):
+        a[bad] = np.nan
+    return weighted, plain, q25, q75, cnt
+
+
+def _f32(a: np.ndarray) -> bytes:
+    return np.asarray(a, dtype="<f4").tobytes()
+
+
+def compute_groups(site: str, seasons=None) -> int:
+    """(Re)computes the crop-group curves of every area of the site for the given seasons (all when
+    None): mean of the parcels' curves, weighted by their interior pixels and one parcel one vote,
+    the middle half of the parcels, counts. Parcels of an unknown crop are only counted."""
+    years_rpg = rpg_years()
+    with connect() as conn:
+        if seasons is None:
+            seasons = {r["season"] for r in conn.execute(
+                "SELECT DISTINCT season FROM eo.parcel_season WHERE site = %s", (site,)).fetchall()}
+    seasons = sorted(seasons)
+    refresh_parcel_info(site, {geometry_year(s, years_rpg) for s in seasons} - {None})
+    n = 0
+    for season in seasons:
+        with connect() as conn:
+            rows = conn.execute(
+                """SELECT c.index, c.rpg_year, c.n_pixels, c.curve, i.code_group, i.surf_ha, i.areas
+                   FROM eo.parcel_season c
+                   JOIN eo.parcel_info i ON i.site = c.site AND i.rpg_year = c.rpg_year AND i.parcel_id = c.parcel_id
+                   WHERE c.site = %s AND c.season = %s ORDER BY c.index, c.parcel_id""", (site, season)).fetchall()
+        out = []
+        for ix in sorted({r["index"] for r in rows}):
+            rs = [r for r in rows if r["index"] == ix]
+            mat = np.stack([np.frombuffer(r["curve"], dtype="<f4") for r in rs]).astype("float64")
+            status = np.array([crop_status(season, r["rpg_year"], r["code_group"]) for r in rs])
+            group = np.array([r["code_group"] or "" for r in rs])
+            ha = np.array([r["surf_ha"] or 0.0 for r in rs])
+            w = np.array([r["n_pixels"] or 1 for r in rs], dtype="float64")
+            members: dict[str, list[int]] = {}
+            for k, r in enumerate(rs):
+                for code in r["areas"]:
+                    members.setdefault(code, []).append(k)
+            for area, idx in members.items():
+                idx = np.asarray(idx)
+                unknown = idx[status[idx] == "unknown"]
+                if unknown.size:
+                    out.append((site, ix, area, "", season, int(unknown.size), float(ha[unknown].sum()), "unknown",
+                                None, None, None, None, None))
+                known = idx[status[idx] != "unknown"]
+                for g in sorted(set(group[known]) - {""}):
+                    sel = known[group[known] == g]
+                    weighted, plain, q25, q75, cnt = _group_curve(mat[sel], w[sel])
+                    st = "declared" if (status[sel] == "declared").all() else "assumed"
+                    out.append((site, ix, area, g, season, int(sel.size), float(ha[sel].sum()), st, _f32(weighted),
+                                _f32(plain), _f32(q25), _f32(q75), cnt.astype("<i2").tobytes()))
+        with connect() as conn:
+            conn.execute("DELETE FROM eo.group_season WHERE site = %s AND season = %s", (site, season))
+            with conn.cursor() as cur:
+                with cur.copy("COPY eo.group_season (site, index, area, code_group, season, parcels, ha, status, "
+                              "mean_pixels, mean_parcel, q25, q75, count) FROM STDIN") as cp:
+                    for r in out:
+                        cp.write_row(r)
+        n += len(out)
+        log.info("Parcels: season %d, %d crop-group curves", season, len(out))
+    return n
 
 
 def clear_cache() -> None:
-    curves.cache_clear()
     clear_labels()
 
 
-def _mean_curve(mat: np.ndarray, min_n: int, w: np.ndarray | None = None
-                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Mean (weighted by w when given), 25th and 75th percentiles across rows, day by day, where at
-    least min_n rows have a value."""
-    if not len(mat):
-        nan = np.full(SEASON_DAYS, np.nan)
-        return nan, nan, nan, np.zeros(SEASON_DAYS, int)
-    cnt = np.isfinite(mat).sum(axis=0)
-    with np.errstate(all="ignore"), _quiet():
-        if w is None:
-            med = np.nanmean(mat, axis=0)
-        else:
-            ok = np.isfinite(mat)
-            ww = np.where(ok, w[:, None], 0.0)
-            med = (np.where(ok, mat, 0.0) * ww).sum(axis=0) / ww.sum(axis=0)
-        q25, q75 = np.nanpercentile(mat, [25, 75], axis=0)
-    bad = cnt < min_n
-    for a in (med, q25, q75):
-        a[bad] = np.nan
-    return med, q25, q75, cnt
+def _curve(b: bytes | None) -> np.ndarray:
+    return np.frombuffer(b, dtype="<f4").astype("float64") if b is not None else np.full(SEASON_DAYS, np.nan)
 
 
 def group_curves(site: str, index: str, area: str, group: str, weighted: bool = True) -> dict[int, dict]:
     """Per season: the group curve in an area (mean of its parcels' curves, weighted by their interior
-    pixels unless ``weighted`` is False), with parcel counts."""
-    df, mat = curves(site, index, stamp(site))
-    if not len(df):
-        return {}
-    sel = (df["code_group"] == group) & (df["crop_status"] != "unknown") & df["areas"].apply(lambda a: area in a)
-    out = {}
-    for season, idx in df[sel].groupby("season").groups.items():
-        rows = np.asarray(list(idx))
-        sub = mat[rows]
-        w = df.loc[rows, "n_pixels"].fillna(1).to_numpy(dtype="float64") if weighted else None
-        mean, q25, q75, cnt = _mean_curve(sub, min_n=min(3, len(rows)), w=w)
-        out[int(season)] = {"mean": mean, "q25": q25, "q75": q75, "count": cnt, "parcels": len(rows),
-                            "ha": float(df.loc[rows, "surf_ha"].fillna(0).sum()),
-                            "status": "declared" if (df.loc[rows, "crop_status"] == "declared").all() else "assumed"}
-    return out
+    pixels unless ``weighted`` is False), with parcel counts (from eo.group_season)."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT season, parcels, ha, status, mean_pixels, mean_parcel, q25, q75, count FROM eo.group_season
+               WHERE site = %s AND index = %s AND area = %s AND code_group = %s ORDER BY season""",
+            (site, index, area, group)).fetchall()
+    return {r["season"]: {"mean": _curve(r["mean_pixels" if weighted else "mean_parcel"]), "q25": _curve(r["q25"]),
+                          "q75": _curve(r["q75"]), "count": np.frombuffer(r["count"], dtype="<i2").astype(int),
+                          "parcels": r["parcels"], "ha": r["ha"], "status": r["status"]}
+            for r in rows}
 
 
 def references(curves_by_season: dict[int, np.ndarray], season: int) -> dict[str, dict]:

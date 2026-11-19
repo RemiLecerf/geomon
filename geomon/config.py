@@ -51,6 +51,9 @@ class Settings:
     # for a single commune, otherwise derived from the codes.
     site_code_env: str = field(default_factory=lambda: _env("GEOMON_SITE_CODE", ""))
     site_name_env: str = field(default_factory=lambda: _env("GEOMON_SITE_NAME", ""))
+    # Or every commune of an administrative unit, e.g. DEP:50 (a département, NUTS-3), EPCI:<SIREN>,
+    # ARR:<code>, REG:28; it replaces GEOMON_COMMUNES
+    unit_env: str = field(default_factory=lambda: _env("GEOMON_UNIT", "").upper())
     aoi_buffer_m: float = field(default_factory=lambda: float(_env("GEOMON_AOI_BUFFER_M", "1000")))
     # The farm's own plots (GeoJSON, e.g. a PAC export), relative to the data directory; optional
     farm_file_env: str = field(default_factory=lambda: _env("GEOMON_FARM_FILE", ""))
@@ -103,10 +106,23 @@ class Settings:
     era5_revision_days: int = field(default_factory=lambda: int(_env("GEOMON_ERA5_REVISION_DAYS", "92")))
     era5_revision_every_days: int = field(default_factory=lambda: int(_env("GEOMON_ERA5_REVISION_EVERY_DAYS", "7")))
     weather_overlap_days: int = field(default_factory=lambda: int(_env("GEOMON_WEATHER_OVERLAP_DAYS", "3")))
+    # ERA5-Land and ERA5: "cds" (Copernicus CDS time-series datasets: steps era5land and era5) or
+    # "openmeteo" (the former source: ERA5-Land completed with ERA5 in one product, om_era5land,
+    # fetched by the weather step within the Open-Meteo daily quota)
+    era5_source: str = field(default_factory=lambda: _env("GEOMON_ERA5_SOURCE", "cds").lower())
+    # ERA5 (0.25°) is kept from this date (default GEOMON_WEATHER_START; 1990-01-01 gives the
+    # 1991-2020 normals). ERA5-Land starts at GEOMON_WEATHER_START.
+    era5_start: dt.date = field(default_factory=lambda: dt.date.fromisoformat(
+        _env("GEOMON_ERA5_START", _env("GEOMON_WEATHER_START", "2022-01-01"))))
     openmeteo_api_key: str = field(default_factory=lambda: _env("GEOMON_OPENMETEO_API_KEY", ""))
     openmeteo_calls_per_minute: float = field(
         default_factory=lambda: float(_env("GEOMON_OPENMETEO_CALLS_PER_MINUTE", "300"))
     )
+    # Points per Open-Meteo request (the coordinates go in the URL)
+    openmeteo_batch_points: int = field(default_factory=lambda: int(_env("GEOMON_OPENMETEO_BATCH_POINTS", "100")))
+    # Largest number of Météo-France grid points per site: beyond it the grid step doubles (0.025°,
+    # 0.05°, 0.1°...). Each point counts in Open-Meteo's daily quota (a forecast ~5 calls per point)
+    weather_max_points: int = field(default_factory=lambda: int(_env("GEOMON_WEATHER_MAX_POINTS", "150")))
     # Copernicus CDS (AgERA5): personal access token from https://cds.climate.copernicus.eu/profile
     cds_api_key: str = field(default_factory=lambda: _env("GEOMON_CDS_API_KEY", _env("CDSAPI_KEY", "")))
     # AgERA5 starts in 1979; its whole history is one small request
@@ -159,9 +175,8 @@ class Settings:
         return self.site.communes
 
     @property
-    def commune(self) -> str:
-        """First commune of the AOI (the reference for the parent units)."""
-        return self.communes[0]
+    def unit(self) -> str:
+        return self.site.unit
 
     @property
     def site_code(self) -> str:
@@ -199,19 +214,39 @@ settings = Settings()
 # ---------------------------------------------------------------------------
 # Sites
 # ---------------------------------------------------------------------------
+# Administrative units a site can cover whole (``unit``), and the attribute of the ADMIN EXPRESS
+# commune layer that names the unit of each commune
+UNIT_LEVELS = {"DEP": "code_insee_du_departement", "REG": "code_insee_de_la_region",
+               "ARR": "code_insee_de_l_arrondissement", "EPCI": "codes_siren_des_epci"}
+
+
 @dataclass(frozen=True)
 class Site:
     code: str
     name: str
-    communes: tuple[str, ...]
+    communes: tuple[str, ...]          # INSEE codes; empty for a site defined by ``unit``
     farm_file: str = ""
     farm_name: str = ""
+    unit: str = ""                     # "DEP:50": every commune of an administrative unit
+
+    def __post_init__(self):
+        if self.unit:
+            level, _, code = self.unit.partition(":")
+            if level not in UNIT_LEVELS or not code:
+                raise ValueError(f"Site {self.code}: unit must be LEVEL:code with LEVEL in "
+                                 f"{', '.join(UNIT_LEVELS)}, not {self.unit!r}")
+        elif not self.communes:
+            raise ValueError(f"Site {self.code}: give its communes or an administrative unit (unit)")
 
 
 _SITES_CACHE: dict = {}
 
 
 def _env_site() -> Site:
+    if settings.unit_env:
+        code = settings.site_code_env or settings.unit_env.lower().replace(":", "-")
+        return Site(code, settings.site_name_env, (), settings.farm_file_env, settings.farm_name_env,
+                    settings.unit_env)
     c = settings.communes_env
     code = settings.site_code_env or (c[0] if len(c) == 1 else "grp-" + "-".join(c))
     return Site(code, settings.site_name_env, c, settings.farm_file_env, settings.farm_name_env)
@@ -230,9 +265,10 @@ def all_sites() -> list[Site]:
     mtime = p.stat().st_mtime
     if _SITES_CACHE.get("mtime") != mtime:
         raw = json.loads(p.read_text(encoding="utf-8"))
-        sites = [Site(code=s["code"], name=s.get("name") or s["code"],
-                      communes=tuple(str(c) for c in s["communes"]),
-                      farm_file=s.get("farm_file", ""), farm_name=s.get("farm_name", "")) for s in raw]
+        sites = [Site(code=s["code"], name=s.get("name") or ("" if s.get("unit") else s["code"]),
+                      communes=tuple(str(c) for c in s.get("communes", ())),
+                      farm_file=s.get("farm_file", ""), farm_name=s.get("farm_name", ""),
+                      unit=str(s.get("unit", "")).upper()) for s in raw]
         if not sites:
             raise ValueError(f"{p}: no site")
         if len({s.code for s in sites}) != len(sites):

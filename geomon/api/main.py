@@ -6,53 +6,60 @@ Run: uvicorn geomon.api.main:app --host 0.0.0.0 --port 8000
 from __future__ import annotations
 
 import json
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from .. import __version__, units
 from ..config import _current, all_sites, settings
 from ..db import connect
 from ..migrate import migrate
-from . import rasters, sentinel2, weather
+from . import rasters, sentinel2, tiles, weather
+from .areas import area as _area
+from .areas import site_row as _site
 
-app = FastAPI(title="Geomon", version=__version__)
-app.include_router(weather.router)
-app.include_router(sentinel2.router)
+log = logging.getLogger(__name__)
 
 SITE_COOKIE = "geomon_site"
+_schema_ready = False
 
 
-@app.on_event("startup")
-def _startup() -> None:
+def _ensure_schema() -> None:
+    """Creates or upgrades the database schema; retried at the next request when it fails
+    (database not reachable yet)."""
+    global _schema_ready
     try:
         migrate()
-    except Exception:          # the database may not be initialised yet
-        pass
-    import threading
-
-    threading.Thread(target=_warm_up, daemon=True, name="warm-up").start()
+        _schema_ready = True
+    except Exception as exc:
+        log.warning("Database schema not checked yet: %s", exc)
 
 
-def _warm_up() -> None:
-    """Loads the parcel curves of every site in the background, so that the first crop-group or
-    parcel view does not wait for them."""
-    from .. import parcels as pc
-    from ..config import use_site
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    await run_in_threadpool(_ensure_schema)
+    yield
 
-    for s in all_sites():
-        try:
-            with use_site(s.code):
-                pc.curves(s.code, "ndvi", pc.stamp(s.code))
-        except Exception:
-            pass
+
+app = FastAPI(title="Geomon", version=__version__, lifespan=_lifespan)
+# GeoJSON layers are large (RPG parcels, OSM buildings: tens of MB) and compress about 5-fold
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+app.include_router(weather.router)
+app.include_router(sentinel2.router)
+app.include_router(tiles.router)
 
 
 @app.middleware("http")
 async def _site_of_request(request: Request, call_next):
     """The site of a request: ``?site=`` (remembered in a cookie), else the cookie, else the first site."""
+    if not _schema_ready:
+        await run_in_threadpool(_ensure_schema)
     codes = [s.code for s in all_sites()]
     asked = request.query_params.get("site")
     code = asked if asked in codes else request.cookies.get(SITE_COOKIE)
@@ -71,12 +78,13 @@ def sites() -> dict:
     """The sites this server follows, and the current one (cookie)."""
     with connect() as conn:
         rows = {r["code"]: r for r in conn.execute(
-            """SELECT code, name, ST_Area(geom::geography) / 1e4 AS area_ha, updated_at
-               FROM meta.aoi WHERE kind = 'site'""").fetchall()} if conn.execute(
-            "SELECT to_regclass('meta.aoi') AS t").fetchone()["t"] else {}
+            """SELECT code, name, members, ST_Area(geom::geography) / 1e4 AS area_ha, updated_at
+               FROM meta.aoi WHERE kind = 'site'""").fetchall()}
     return {"current": settings.site_code,
             "sites": [{"code": s.code, "name": (rows.get(s.code) or {}).get("name") or s.name or s.code,
-                       "communes": list(s.communes), "loaded": s.code in rows,
+                       "unit": s.unit or None,
+                       "communes": list(s.communes) or list((rows.get(s.code) or {}).get("members") or []),
+                       "loaded": s.code in rows,
                        "area_ha": (rows.get(s.code) or {}).get("area_ha"), "farm": bool(s.farm_file)}
                       for s in all_sites()]}
 
@@ -87,7 +95,7 @@ SIMPLIFY = {"COM": 0.00002, "EPCI": 0.0001, "ARR": 0.0005, "DEP": 0.001, "REG": 
 LEVEL_ORDER = ["COM", "EPCI", "ARR", "DEP", "REG", "FRANCE"]
 LEVEL_NAMES = {"COM": "Commune", "EPCI": "Intercommunalité (EPCI)", "ARR": "Arrondissement",
                "DEP": "Département", "REG": "Région", "FRANCE": "Pays"}
-OSM_LAYERS = {"roads", "railways", "waterways", "buildings", "landuse", "water", "pois"}
+OSM_LAYERS = tiles.OSM_LAYERS
 
 
 def _feature_collection(rows: list[dict]) -> JSONResponse:
@@ -97,43 +105,6 @@ def _feature_collection(rows: list[dict]) -> JSONResponse:
         if r.get("geojson")
     ]
     return JSONResponse({"type": "FeatureCollection", "features": feats})
-
-
-def _site(conn) -> dict:
-    row = conn.execute(
-        """SELECT code, name, members, ST_AsGeoJSON(bbox) AS bbox FROM meta.aoi WHERE kind = 'site' AND code = %s""",
-        (settings.site_code,),
-    ).fetchone()
-    if not row:
-        raise HTTPException(503, "No AOI yet: run the ingestion (docker compose run --rm ingest)")
-    return row
-
-
-def _area(conn, area: str | None) -> dict:
-    """An analysis area: the site (group) by default, or one of its communes.
-
-    Returns code, name, kind ('site' or 'commune'), members (INSEE codes),
-    area in ha and the outline as GeoJSON.
-    """
-    site = _site(conn)
-    if area in (None, "", site["code"]):
-        kind, code = "site", site["code"]
-    elif area in site["members"]:
-        kind, code = "commune", area
-    elif area == "farm" and conn.execute("SELECT 1 FROM meta.aoi WHERE kind = 'farm' AND site = %s",
-                                         (site["code"],)).fetchone():
-        kind, code = "farm", area
-    else:
-        raise HTTPException(404, f"Area {area} is not part of the AOI ({', '.join(site['members'])})")
-    row = conn.execute(
-        """SELECT code, name, kind, members, ST_AsGeoJSON(geom) AS geojson,
-                  ST_Area(geom::geography) / 1e4 AS area_ha
-           FROM meta.aoi WHERE kind = %s AND code = %s AND site = %s""",
-        (kind, code, site["code"]),
-    ).fetchone()
-    row["geometry"] = json.loads(row.pop("geojson"))
-    row["is_group"] = kind == "site" and len(row["members"]) > 1
-    return row
 
 
 # ---------------------------------------------------------------------------
@@ -173,17 +144,16 @@ def aoi() -> dict:
                     wanted[lv].append(v)
         wanted["COM"] = [c["code"] for c in communes]
         wanted["FRANCE"] = ["F"]
+        # One query for every unit (a département site has hundreds of communes)
+        pairs = [(lv, code) for lv in LEVEL_ORDER for code in wanted[lv]]
+        found = {(r["level"], r["code"]): r for r in conn.execute(
+            """SELECT level, code, name, vintage, valid_from, valid_to, source FROM ref.admin_unit
+               WHERE (level, code) IN (SELECT * FROM unnest(%s::text[], %s::text[])) AND valid_to IS NULL""",
+            ([lv for lv, _ in pairs], [c for _, c in pairs])).fetchall()}
         hierarchy = []
-        for level in LEVEL_ORDER:
-            for code in wanted[level]:
-                r = conn.execute(
-                    """SELECT level, code, name, vintage, valid_from, valid_to, source
-                       FROM ref.admin_unit WHERE level = %s AND code = %s AND valid_to IS NULL""",
-                    (level, code),
-                ).fetchone()
-                if r:
-                    r["level_name"] = LEVEL_NAMES[level]
-                    hierarchy.append(r)
+        for key in pairs:
+            if key in found:
+                hierarchy.append(found[key] | {"level_name": LEVEL_NAMES[key[0]]})
     is_group = len(communes) > 1
     areas = ([{"code": site["code"], "kind": "site", "name": site["name"], "members": site["members"],
                "area_ha": group["area_ha"]}] if is_group else [])
@@ -203,7 +173,9 @@ def aoi() -> dict:
         "center": [group["lon"], group["lat"]] if group else None,
         "area_ha": group["area_ha"] if group else None,
         "postal_code": first["postal_code"] if first and not is_group else None,
+        "unit": settings.unit or None,
         "communes": [{"code": c["code"], "name": c["name"], "postal_code": c["postal_code"],
+                      "epci": ((c["props"] or {}).get("codes_siren_des_epci") or "").split("/")[0] or None,
                       "area_ha": c["area_ha"], "center": [c["lon"], c["lat"]],
                       "bbox": [c["x0"], c["y0"], c["x1"], c["y1"]]} for c in communes],
         "areas": areas,
@@ -215,8 +187,6 @@ def aoi() -> dict:
 def conn_farm() -> dict | None:
     """The farm area (GEOMON_FARM_FILE), if loaded."""
     with connect() as conn:
-        if not conn.execute("SELECT to_regclass('ref.farm_plot') AS t").fetchone()["t"]:
-            return None
         row = conn.execute(
             """SELECT a.code, a.name, a.members, ST_Area(a.geom::geography) / 1e4 AS area_ha,
                       ST_XMin(a.geom) AS x0, ST_YMin(a.geom) AS y0, ST_XMax(a.geom) AS x1, ST_YMax(a.geom) AS y1,
@@ -324,10 +294,15 @@ def rpg_summary(year: int | None = None, area: str | None = None) -> dict:
         rows = conn.execute(
             """SELECT p.code_group, COALESCE(c.label_group, p.code_group) AS crop_group,
                       count(*) AS parcels,
-                      sum(ST_Area(ST_Intersection(p.geom, a.geom)::geography)) / 1e4 AS area_ha
+                      -- only the parcels crossing the outline are clipped (3x faster for a group)
+                      sum(ST_Area(CASE WHEN ST_CoveredBy(p.geom, a.geom) THEN p.geom
+                                       ELSE ST_Intersection(p.geom, a.geom) END::geography)) / 1e4 AS area_ha
                FROM ref.rpg_parcel p
                JOIN meta.aoi a ON a.kind = %s AND a.code = %s AND a.site = %s AND ST_Intersects(p.geom, a.geom)
-               LEFT JOIN (SELECT DISTINCT year, code_group, label_group FROM ref.rpg_crop_code) c
+               -- One label per group: a code list may give a group two labels (PME in group 25
+               -- since 2023), which would count its parcels twice
+               LEFT JOIN (SELECT year, code_group, mode() WITHIN GROUP (ORDER BY label_group) AS label_group
+                          FROM ref.rpg_crop_code GROUP BY year, code_group) c
                       ON c.year = p.year AND c.code_group = p.code_group
                WHERE p.year = %s
                GROUP BY 1, 2 ORDER BY area_ha DESC""",
@@ -364,27 +339,36 @@ def raster_catalogue() -> list[dict]:
     return rasters.catalogue()
 
 
-def _render(name: str, var: str, depth: int) -> rasters.Rendered:
+def _raster(fn, name: str, var: str, *args):
     if name not in rasters.DATASETS:
         raise HTTPException(404, f"Unknown raster dataset {name}")
     try:
-        return rasters.render(name, var, depth)
+        return fn(name, var, *args)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(404, f"Unknown variable {var}") from exc
+    except (KeyError, IndexError) as exc:
+        raise HTTPException(404, f"Unknown variable or depth {var} {args[:1]}") from exc
 
 
 @app.get("/api/raster/{name}/{var}/info")
 def raster_info(name: str, var: str, depth: int = 0) -> dict:
-    r = _render(name, var, depth)
-    return {"coordinates": r.coordinates, "vmin": r.vmin, "vmax": r.vmax, "units": r.units,
-            "long_name": r.long_name, "colormap": r.colormap, "legend": r.legend}
+    """Legend, extent and tile URL template of a raster variable."""
+    return _raster(rasters.info, name, var, depth)
+
+
+@app.get("/api/raster/{name}/{var}/tiles/{z}/{x}/{y}.png")
+def raster_tile(name: str, var: str, z: int, x: int, y: int, depth: int = 0) -> Response:
+    if not (0 <= z <= 22 and 0 <= x < 2 ** z and 0 <= y < 2 ** z):
+        raise HTTPException(404, f"No tile {z}/{x}/{y}")
+    png = _raster(rasters.tile, name, var, depth, z, x, y)
+    # The URL carries the dataset's version (v=): a tile never changes
+    return Response(png, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
 
 
 @app.get("/api/raster/{name}/{var}.png")
 def raster_png(name: str, var: str, depth: int = 0) -> Response:
-    r = _render(name, var, depth)
+    """The whole variable as one image (large for a 5 m DEM: the map uses the tiles)."""
+    r = _raster(rasters.render, name, var, depth)
     return Response(r.png, media_type="image/png", headers={"Cache-Control": "max-age=3600"})
 
 
@@ -630,7 +614,8 @@ def status() -> dict:
             """SELECT DISTINCT ON (step) step, status, finished_at, message, details
                FROM meta.ingest_log WHERE site = %s ORDER BY step, finished_at DESC""", (settings.site_code,)
         ).fetchall()
-    return {"version": __version__, "aoi": settings.site_code, "communes": list(settings.communes),
+    return {"version": __version__, "aoi": settings.site_code, "unit": settings.unit or None,
+            "communes": list(settings.communes),
             "ingestion": log}
 
 

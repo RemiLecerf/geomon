@@ -18,6 +18,7 @@ x-geomon-env: &geomon-env
   GEOMON_COMMUNES: ${GEOMON_COMMUNES:-}
   GEOMON_SITE_CODE: ${GEOMON_SITE_CODE:-}
   GEOMON_SITE_NAME: ${GEOMON_SITE_NAME:-}
+  GEOMON_UNIT: ${GEOMON_UNIT:-}
   GEOMON_AOI_BUFFER_M: ${GEOMON_AOI_BUFFER_M:-1000}
   GEOMON_SITES_FILE: ${GEOMON_SITES_FILE:-sites.json}
   GEOMON_FARM_FILE: ${GEOMON_FARM_FILE:-}
@@ -30,10 +31,14 @@ x-geomon-env: &geomon-env
   GEOMON_SOIL_RES_M: ${GEOMON_SOIL_RES_M:-250}
   GEOMON_WEATHER_START: ${GEOMON_WEATHER_START:-2022-01-01}
   GEOMON_WEATHER_GRID_DEG: ${GEOMON_WEATHER_GRID_DEG:-0.025}
+  GEOMON_WEATHER_MAX_POINTS: ${GEOMON_WEATHER_MAX_POINTS:-150}
+  GEOMON_OPENMETEO_BATCH_POINTS: ${GEOMON_OPENMETEO_BATCH_POINTS:-100}
   GEOMON_SIM2_START: ${GEOMON_SIM2_START:-1990-01-01}
   GEOMON_FORECAST_MIN_HOURS: ${GEOMON_FORECAST_MIN_HOURS:-3}
   GEOMON_ERA5_REVISION_DAYS: ${GEOMON_ERA5_REVISION_DAYS:-92}
   GEOMON_ERA5_REVISION_EVERY_DAYS: ${GEOMON_ERA5_REVISION_EVERY_DAYS:-7}
+  GEOMON_ERA5_SOURCE: ${GEOMON_ERA5_SOURCE:-cds}
+  GEOMON_ERA5_START: ${GEOMON_ERA5_START:-}
   GEOMON_OPENMETEO_API_KEY: ${GEOMON_OPENMETEO_API_KEY:-}
   GEOMON_CDS_API_KEY: ${GEOMON_CDS_API_KEY:-}
   GEOMON_AGERA5_START: ${GEOMON_AGERA5_START:-1979-01-01}
@@ -113,4 +118,15 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    profiles: ["tools"]
+
+  # Unit tests, on the working copy (no rebuild needed): docker compose run --rm test
+  # No database, network or data: GEOMON_DATA_DIR is a scratch folder (tests/conftest.py).
+  test:
+    image: geomon:dev
+    entrypoint: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]
+    working_dir: /src
+    volumes:
+      - ./geomon:/src/geomon:ro
+      - ./tests:/src/tests:ro
     profiles: ["tools"]

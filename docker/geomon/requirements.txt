@@ -31,3 +31,6 @@ pint>=0.24
 # Rendering raster layers for the web map
 matplotlib>=3.9
 pillow>=10.4
+
+# Tests (docker compose run --rm test)
+pytest>=8.3
