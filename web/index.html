@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Geomon</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%232f6f4f'/%3E%3Cpath d='M2 10c3-3 6 1 12-3' stroke='%23fff' stroke-width='1.5' fill='none'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside id="panel">
+    <header>
+      <h1>Geomon</h1>
+      <div id="aoi-title">Loading…</div>
+      <label class="row" id="site-row" hidden>Site <select id="site"></select></label>
+      <label class="row" id="area-row" hidden>Area <select id="area"></select></label>
+    </header>
+    <nav id="tabs">
+      <button data-tab="layers" class="active">Layers</button>
+      <button data-tab="commune">Statistics</button>
+      <button data-tab="weather">Weather</button>
+      <button data-tab="s2">Sentinel-2</button>
+      <button data-tab="point">Point</button>
+    </nav>
+
+    <section id="tab-layers" class="tab active">
+      <h2>Base map</h2>
+      <div id="basemaps" class="radio-list"></div>
+
+      <h2>Vector layers</h2>
+      <div id="vector-layers" class="check-list"></div>
+
+      <h2>Raster layer</h2>
+      <label class="row">Dataset
+        <select id="raster-var"><option value="">— none —</option></select>
+      </label>
+      <label class="row" id="depth-row" hidden>Depth
+        <select id="raster-depth"></select>
+      </label>
+      <label class="row">Opacity
+        <input id="raster-opacity" type="range" min="0" max="1" step="0.05" value="0.75">
+      </label>
+      <div id="raster-legend" class="legend"></div>
+
+      <h2>RPG crop groups</h2>
+      <div id="rpg-summary" class="legend"></div>
+    </section>
+
+    <section id="tab-commune" class="tab">
+      <div id="area-summary"></div>
+      <h2>Statistics</h2>
+      <label class="row">For
+        <select id="stats-geo"></select>
+      </label>
+      <div id="hierarchy"></div>
+      <h2>Municipal population</h2>
+      <div id="pop-chart" class="chart"></div>
+      <h2>Key indicators</h2>
+      <div id="stats-summary"></div>
+      <h2>Explore a dataset</h2>
+      <label class="row">Dataset <select id="stats-dataset"></select></label>
+      <label class="row">Period <select id="stats-period"></select></label>
+      <div id="stats-table" class="table-wrap"></div>
+    </section>
+
+    <section id="tab-weather" class="tab">
+      <div id="wx-location" class="hint"></div>
+      <label class="row">View
+        <select id="wx-view">
+          <option value="sources">Sources compared over a period</option>
+          <option value="normal">This year against the 1991–2020 normal</option>
+        </select>
+      </label>
+      <label class="row">Variable <select id="wx-var"></select></label>
+      <div id="wx-sources-controls">
+        <label class="row">Period
+          <select id="wx-period">
+            <option value="60d">Last 60 days + forecast (daily)</option>
+            <option value="1y">Last 12 months (weekly)</option>
+            <option value="all">Whole record (monthly)</option>
+          </select>
+        </label>
+        <div id="wx-series" class="check-list"></div>
+        <label class="check-list"><label><input type="checkbox" id="wx-cells"> Show the grid cells on the map</label></label>
+      </div>
+      <div id="wx-normal-controls" hidden>
+        <label class="row">Source
+          <select id="wx-nsource"></select>
+        </label>
+        <label class="row">Year from
+          <select id="wx-nstart">
+            <option value="01-01">1 January (calendar year)</option>
+            <option value="09-01">1 September (crop year)</option>
+            <option value="10-01">1 October (hydrological year)</option>
+          </select>
+        </label>
+        <label class="row">Year <select id="wx-nyear"></select></label>
+        <label class="row">Show
+          <select id="wx-nzoom">
+            <option value="recent">Last 90 days and forecast</option>
+            <option value="year">Whole year</option>
+          </select>
+        </label>
+        <label class="check-list"><label><input type="checkbox" id="wx-nforecast" checked> Continue with the Météo-France archive and forecast</label></label>
+      </div>
+      <div id="wx-chart" class="chart"></div>
+      <div id="wx-compare"></div>
+      <h2>Forecast</h2>
+      <div id="wx-forecast"></div>
+      <div id="wx-sources" class="muted" style="font-size:11px"></div>
+    </section>
+
+    <section id="tab-s2" class="tab">
+      <label class="row">View
+        <select id="s2-view">
+          <option value="area">Whole area (all land)</option>
+          <option value="crop">Crop group (RPG parcels)</option>
+          <option value="parcel">One parcel (click the map)</option>
+        </select>
+      </label>
+      <div id="s2-status" class="hint"></div>
+      <label class="row">Index <select id="s2-index"></select></label>
+      <div id="s2-area-controls">
+        <label class="row">Period <select id="s2-year"></select></label>
+        <label class="row">Clear area at least
+          <select id="s2-clear">
+            <option value="0.3">30 %</option>
+            <option value="0.6">60 %</option>
+            <option value="0.9" selected>90 %</option>
+            <option value="0.99">100 %</option>
+          </select>
+        </label>
+      </div>
+      <div id="s2-season-controls" hidden>
+        <label class="row" id="s2-group-row">Crop group <select id="s2-group"></select></label>
+        <label class="row">Season <select id="s2-season"></select></label>
+        <label class="row" id="s2-refarea-row" hidden>References from
+          <select id="s2-refarea"></select>
+        </label>
+        <label class="row">Group average
+          <select id="s2-weight">
+            <option value="pixels" selected>By area (interior pixels)</option>
+            <option value="parcel">One parcel, one vote</option>
+          </select>
+        </label>
+        <div class="check-list" id="s2-refs">
+          <label><input type="checkbox" value="3y" checked> 3-year mean</label>
+          <label><input type="checkbox" value="5y" checked> 5-year mean</label>
+          <label><input type="checkbox" value="lt" checked> Long-term mean and range</label>
+          <label id="s2-own-row"><input type="checkbox" value="own" checked> This parcel, earlier seasons</label>
+        </div>
+      </div>
+      <div id="s2-chart" class="chart"></div>
+      <div id="s2-compare"></div>
+      <div id="s2-history"></div>
+      <h2>Image</h2>
+      <label class="row">Date <select id="s2-date"></select></label>
+      <label class="check-list"><label><input type="checkbox" id="s2-mask" checked> Hide clouds, shadows and snow (SCL)</label></label>
+      <label class="row">Opacity <input id="s2-opacity" type="range" min="0" max="1" step="0.05" value="0.85"></label>
+      <div id="s2-legend" class="legend"></div>
+      <div id="s2-sources" class="muted" style="font-size:11px"></div>
+    </section>
+
+    <section id="tab-point" class="tab">
+      <p class="hint">Click on the map to query every layer at that point.</p>
+      <div id="point-info"></div>
+    </section>
+
+    <footer>
+      Sources: IGN (ADMIN EXPRESS, RPG, RGE ALTI, Plan IGN, BD ORTHO), © OpenStreetMap contributors,
+      ISRIC SoilGrids 2.0, INSEE, Météo-France (SIM2; AROME/ARPEGE via Open-Meteo), ECMWF, Copernicus ERA5-Land and AgERA5 (C3S), Copernicus Sentinel-2 (ESA, via the Copernicus Data Space openEO), Open-Meteo (CC BY 4.0).
+    </footer>
+  </aside>
+  <main id="map"></main>
+
+  <script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

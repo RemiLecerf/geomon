@@ -1,0 +1,10 @@
+# Data lives on the host but is never committed
+data/
+.env
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+data-*/
+.env.*
+!.env.example

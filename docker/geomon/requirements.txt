@@ -1,0 +1,33 @@
+# Web API
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# Database
+psycopg[binary]>=3.2
+
+# HTTP
+requests>=2.32
+cdsapi>=0.7.4         # Copernicus CDS (AgERA5)
+openeo>=0.54          # openEO client (Sentinel-2 from the Copernicus Data Space)
+
+# Geospatial / arrays
+numpy>=2.0
+scipy>=1.14           # Whittaker smoother of parcel index series (banded solver)
+xarray>=2024.10
+zarr>=3.0
+dask[array]>=2024.10
+rasterio>=1.4
+rioxarray>=0.17
+pyproj>=3.7
+shapely>=2.0
+geopandas>=1.0
+xvec>=0.3
+h5netcdf>=1.3
+h5py>=3.11
+
+# Units (Specifications §3.5)
+pint>=0.24
+
+# Rendering raster layers for the web map
+matplotlib>=3.9
+pillow>=10.4

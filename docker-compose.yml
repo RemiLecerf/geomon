@@ -1,0 +1,116 @@
+# Geomon — first product (static data for one AOI)
+#
+# All data lives on the host under ${GEOMON_DATA_DIR:-./data} (Specifications §3.1):
+#   data/postgres  PostgreSQL/PostGIS cluster
+#   data/zarr      rasters (DEM, soil) as Zarr
+#   data/raw       raw downloads kept as a local archive (OSM data, INSEE code lists)
+
+name: geomon
+
+x-geomon-env: &geomon-env
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-geomon}
+  POSTGRES_USER: ${POSTGRES_USER:-geomon}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geomon}
+  GEOMON_DATA_DIR: /data
+  GEOMON_COMMUNE: ${GEOMON_COMMUNE:-38259}
+  GEOMON_COMMUNES: ${GEOMON_COMMUNES:-}
+  GEOMON_SITE_CODE: ${GEOMON_SITE_CODE:-}
+  GEOMON_SITE_NAME: ${GEOMON_SITE_NAME:-}
+  GEOMON_AOI_BUFFER_M: ${GEOMON_AOI_BUFFER_M:-1000}
+  GEOMON_SITES_FILE: ${GEOMON_SITES_FILE:-sites.json}
+  GEOMON_FARM_FILE: ${GEOMON_FARM_FILE:-}
+  GEOMON_FARM_NAME: ${GEOMON_FARM_NAME:-}
+  GEOMON_COG_VINTAGE: ${GEOMON_COG_VINTAGE:-2026}
+  GEOMON_RPG_LAYER: ${GEOMON_RPG_LAYER:-RPG.LATEST}
+  GEOMON_RPG_YEAR: ${GEOMON_RPG_YEAR:-2025}
+  GEOMON_RPG_FIRST_YEAR: ${GEOMON_RPG_FIRST_YEAR:-2015}
+  GEOMON_DEM_RES_M: ${GEOMON_DEM_RES_M:-5}
+  GEOMON_SOIL_RES_M: ${GEOMON_SOIL_RES_M:-250}
+  GEOMON_WEATHER_START: ${GEOMON_WEATHER_START:-2022-01-01}
+  GEOMON_WEATHER_GRID_DEG: ${GEOMON_WEATHER_GRID_DEG:-0.025}
+  GEOMON_SIM2_START: ${GEOMON_SIM2_START:-1990-01-01}
+  GEOMON_FORECAST_MIN_HOURS: ${GEOMON_FORECAST_MIN_HOURS:-3}
+  GEOMON_ERA5_REVISION_DAYS: ${GEOMON_ERA5_REVISION_DAYS:-92}
+  GEOMON_ERA5_REVISION_EVERY_DAYS: ${GEOMON_ERA5_REVISION_EVERY_DAYS:-7}
+  GEOMON_OPENMETEO_API_KEY: ${GEOMON_OPENMETEO_API_KEY:-}
+  GEOMON_CDS_API_KEY: ${GEOMON_CDS_API_KEY:-}
+  GEOMON_AGERA5_START: ${GEOMON_AGERA5_START:-1979-01-01}
+  GEOMON_S2_START: ${GEOMON_S2_START:-2015-06-27}
+  GEOMON_S2_BANDS: ${GEOMON_S2_BANDS:-B04,B08}
+  GEOMON_S2_PARCEL_MIN_CLEAR: ${GEOMON_S2_PARCEL_MIN_CLEAR:-0.8}
+  GEOMON_S2_PARCEL_SMOOTHING: ${GEOMON_S2_PARCEL_SMOOTHING:-none}
+  GEOMON_S2_MAX_CLOUD: ${GEOMON_S2_MAX_CLOUD:-80}
+  # openEO login (refresh token) kept on the host, under data/state
+  XDG_DATA_HOME: /data/state/xdg
+  GEOMON_OSM_SOURCE: ${GEOMON_OSM_SOURCE:-overpass}
+  GEOMON_OVERPASS_URLS: ${GEOMON_OVERPASS_URLS:-https://overpass-api.de/api/interpreter}
+  GEOMON_OSM_PBF_URL: ${GEOMON_OSM_PBF_URL:-https://download.geofabrik.de/europe/france/rhone-alpes-latest.osm.pbf}
+  GEOMON_OSM_MAX_AGE_DAYS: ${GEOMON_OSM_MAX_AGE_DAYS:-30}
+
+services:
+  db:
+    image: postgis/postgis:18-3.6
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-geomon}
+      POSTGRES_USER: ${POSTGRES_USER:-geomon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geomon}
+    volumes:
+      - ${GEOMON_DATA_DIR:-./data}/postgres:/var/lib/postgresql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${GEOMON_DB_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Web API + web page (http://localhost:8088)
+  api:
+    build:
+      context: .
+      dockerfile: docker/geomon/Dockerfile
+    image: geomon:dev
+    command: ["uvicorn", "geomon.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *geomon-env
+    volumes:
+      - ${GEOMON_DATA_DIR:-./data}:/data
+    ports:
+      - "127.0.0.1:${GEOMON_WEB_PORT:-8088}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Keeps the weather up to date: forecast at each new model run, history daily
+  # (see geomon/scheduler.py). Status: docker compose exec scheduler python -m geomon.scheduler --status
+  scheduler:
+    image: geomon:dev
+    command: ["python", "-m", "geomon.scheduler"]
+    environment: *geomon-env
+    volumes:
+      - ${GEOMON_DATA_DIR:-./data}:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    stop_grace_period: 2m
+    restart: unless-stopped
+
+  # One-shot data acquisition: docker compose run --rm ingest [all|admin|rpg|osm|dem|soil|insee|weather|sim2|agera5|sentinel2|forecast|sentinel2-login]
+  ingest:
+    image: geomon:dev
+    build:
+      context: .
+      dockerfile: docker/geomon/Dockerfile
+    entrypoint: ["python", "-m", "geomon.ingest"]
+    command: ["all"]
+    environment: *geomon-env
+    volumes:
+      - ${GEOMON_DATA_DIR:-./data}:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["tools"]
