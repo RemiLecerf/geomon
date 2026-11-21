@@ -93,9 +93,28 @@ class AOI:
         return self._distinct("departement")
 
     @property
+    def centre_wgs84(self) -> tuple[float, float]:
+        x0, y0, x1, y1 = self.bbox_wgs84
+        return (x0 + x1) / 2, (y0 + y1) / 2
+
+    @property
     def regions(self) -> list[str]:
         return self._distinct("region")
 
+
+
+def site_areas(site: str) -> tuple[dict[str, dict], set[str]]:
+    """The analysis areas of a site (meta.aoi, in their order): {code: outline (GeoJSON, WGS84)},
+    and the codes of its communes (they partition the site)."""
+    with connect() as conn:
+        rows = conn.execute("SELECT code, kind, ST_AsGeoJSON(geom) AS g FROM meta.aoi WHERE site = %s ORDER BY position",
+                            (site,)).fetchall()
+    return {r["code"]: json.loads(r["g"]) for r in rows}, {r["code"] for r in rows if r["kind"] == "commune"}
+
+
+def departement_of(commune: str) -> str:
+    """The département of a commune code (INSEE): 3 characters overseas (97x), else 2 (2A, 2B)."""
+    return commune[:3] if commune.startswith("97") else commune[:2]
 
 
 def _snap(bounds: tuple[float, float, float, float], step: float) -> tuple[float, float, float, float]:

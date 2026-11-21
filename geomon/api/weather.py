@@ -98,7 +98,8 @@ def daily(var: str, lon: float | None = None, lat: float | None = None, area: st
     group when neither is given), each grid cell weighted by its overlap.
 
     ``series``: comma-separated keys among mf (Météo-France history + forecast),
-    era5land, era5, agera5 and sim2. Weekly and monthly values are sums for accumulations and
+    era5land, era5, agera5, sim2, stations (measured, nearest Météo-France stations), comephore
+    (radar + rain gauge reanalysis, rain only) and mf_etp (Météo-France ETP grid). Weekly and monthly values are sums for accumulations and
     means otherwise; incomplete periods of sums are left empty.
     """
     if var not in w.DAILY:
@@ -128,7 +129,7 @@ def daily(var: str, lon: float | None = None, lat: float | None = None, area: st
             s = s[s.index <= pd.Timestamp(end)]
         s = w.resample(s, step)[var]
         item |= {
-            "point": r["point"], "cells": r.get("cells"),
+            "point": r["point"], "cells": r.get("cells"), "stations": r.get("stations"),
             "forecast_from": r["forecast_from"], "forecast_run": r.get("forecast_run"),
             "updated": r["updated"],
             "dates": [d.strftime("%Y-%m-%d") for d in s.index],
@@ -175,7 +176,8 @@ def normals(var: str, series: str = "sim2", lon: float | None = None, lat: float
     r = _series(series, lon, lat, region, [var])
     base = {"variable": {"name": meta.name, "long_name": meta.long_name, "units": meta.units, "how": meta.how},
             "series": {"key": series, "label": w.SERIES[series]["label"], "updated": r.get("updated")},
-            "point": r.get("point"), "cells": len(r.get("cells") or []) or None, "area": _area_info(region)}
+            "point": r.get("point"), "cells": len(r.get("cells") or []) or None, "stations": r.get("stations"),
+            "area": _area_info(region)}
     if not r.get("available") or var not in r["table"]:
         return base | {"available": False, "reason": f"{w.SERIES[series]['label']} does not provide this variable here"}
     obs = r["table"][var]

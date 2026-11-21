@@ -105,27 +105,49 @@ def _render_cached(site: str, date: str, index: str, masked: bool, part: str,
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     ix = s2.INDICES[index]
-    x, y = ds["x"].values, ds["y"].values
+    png, coords = grid_png(arr, ds["x"].values, ds["y"].values, s2.crs_of(ds), ix.vmin, ix.vmax, ix.colormap)
+    return png, coords, ix.vmin, ix.vmax, ix.colormap
+
+
+def grid_png(arr: np.ndarray, x: np.ndarray, y: np.ndarray, crs: str, vmin: float, vmax: float,
+             colormap: str) -> tuple[bytes, list]:
+    """A 2-D array on a north-up grid (cell centres x, y) as a Web Mercator PNG for the map, and
+    the lon/lat of its corners (TL, TR, BR, BL). Transparent where NaN. Also used for Sentinel-1."""
+    cmap = colormaps[colormap]
+
+    def to_rgba(dst: np.ndarray) -> np.ndarray:
+        norm = np.clip((dst - vmin) / (vmax - vmin), 0, 1)
+        rgba = (cmap(np.nan_to_num(norm)) * 255).astype("uint8")
+        rgba[..., 3] = np.where(np.isfinite(dst), 230, 0)
+        return rgba
+
+    return grid_rgba_png(arr, x, y, crs, to_rgba)
+
+
+def grid_rgba_png(arr: np.ndarray, x: np.ndarray, y: np.ndarray, crs: str, to_rgba) -> tuple[bytes, list]:
+    """As :func:`grid_png`, with the colours given by ``to_rgba`` (reprojected values, NaN outside
+    or without data -> RGBA uint8 image)."""
     res = float(abs(x[1] - x[0]))
-    crs = s2.crs_of(ds)
     src_transform = from_origin(float(x[0] - res / 2), float(y[0] + res / 2), res, res)
     h, w = arr.shape
     left, top = x[0] - res / 2, y[0] + res / 2
     dst_transform, dw, dh = calculate_default_transform(crs, "EPSG:3857", w, h, left=left, bottom=top - h * res,
                                                         right=left + w * res, top=top)
     dst = np.full((dh, dw), np.nan, dtype="float32")
-    reproject(arr, dst, src_transform=src_transform, src_crs=crs, src_nodata=np.nan,
+    reproject(arr.astype("float32"), dst, src_transform=src_transform, src_crs=crs, src_nodata=np.nan,
               dst_transform=dst_transform, dst_crs="EPSG:3857", dst_nodata=np.nan, resampling=Resampling.nearest)
-    cmap = colormaps[ix.colormap]
-    norm = np.clip((dst - ix.vmin) / (ix.vmax - ix.vmin), 0, 1)
-    rgba = (cmap(np.nan_to_num(norm)) * 255).astype("uint8")
-    rgba[..., 3] = np.where(np.isfinite(dst), 230, 0)
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG")      # optimize=True: several times slower
+    Image.fromarray(to_rgba(dst), "RGBA").save(buf, format="PNG")      # optimize=True: several times slower
     x0, y1 = dst_transform.c, dst_transform.f
     x1, y0 = x0 + dw * dst_transform.a, y1 + dh * dst_transform.e
     coords = [list(_merc_to_wgs.transform(cx, cy)) for cx, cy in ((x0, y1), (x1, y1), (x1, y0), (x0, y0))]
-    return buf.getvalue(), coords, ix.vmin, ix.vmax, ix.colormap
+    return buf.getvalue(), coords
+
+
+def legend(vmin: float, vmax: float, colormap: str) -> list[dict]:
+    cmap = colormaps[colormap]
+    return [{"value": vmin + f * (vmax - vmin), "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in cmap(f)[:3])}
+            for f in np.linspace(0, 1, 6)]
 
 
 @router.get("/{index}/info")
@@ -143,13 +165,9 @@ def image_info(index: str, date: str, masked: bool = True) -> dict:
                        "url": f"/api/s2/{index}.png?date={date}&masked={str(masked).lower()}&part={part}&site={site}"})
     if not images:
         raise HTTPException(404, f"No Sentinel-2 scene on {date}")
-    cmap = colormaps[cmap_name]
     return {"date": date, "index": index, "long_name": s2.INDICES[index].long_name,
             "coordinates": images[0]["coordinates"], "images": images,
-            "vmin": vmin, "vmax": vmax, "masked": masked,
-            "legend": [{"value": vmin + f * (vmax - vmin),
-                        "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in cmap(f)[:3])}
-                       for f in np.linspace(0, 1, 6)]}
+            "vmin": vmin, "vmax": vmax, "masked": masked, "legend": legend(vmin, vmax, cmap_name)}
 
 
 @router.get("/{index}.png")
@@ -171,6 +189,10 @@ def _crop_labels(conn) -> tuple[dict, dict]:
     groups = {r["code_group"]: r["label"] for r in conn.execute(
         """SELECT year, code_group, mode() WITHIN GROUP (ORDER BY label_group) AS label FROM ref.rpg_crop_code
            WHERE code_group IS NOT NULL AND label_group IS NOT NULL GROUP BY 1, 2 ORDER BY 1""").fetchall()}
+    # Groups of the RPG 1.0 îlots only (seeds, industrial set-aside, arboriculture...)
+    for r in conn.execute("SELECT code_group, min(group_label) AS label FROM ref.rpg_ilot "
+                          "WHERE code_group IS NOT NULL GROUP BY 1").fetchall():
+        groups.setdefault(r["code_group"], (r["label"] or r["code_group"]).capitalize())
     return crops, groups
 
 
@@ -187,23 +209,19 @@ def _season_info(season: int) -> dict:
 _NO_SERIES = "No parcel series yet: run docker compose run --rm ingest sentinel2-parcels"
 
 
-@router.get("/crops")
-def crops(index: str = "ndvi", area: str | None = None, season: int | None = None) -> dict:
-    """Seasons with parcel curves, and the crop groups of an area in a season (parcels, area)."""
-    _check_index(index)
-    site = _site()
-    area = area or site
+def crops_payload(site: str, index: str, area: str, season: int | None, no_series: str) -> dict:
+    """Seasons with crop-group curves, and the crop groups of an area in a season (also for MODIS)."""
     with connect() as conn:
         _, glabels = _crop_labels(conn)
         years_rpg = pc.rpg_years(conn)
         seasons = [r["season"] for r in conn.execute(
-            "SELECT DISTINCT season FROM eo.group_season WHERE site = %s AND index = %s ORDER BY 1",
-            (site, index)).fetchall()]
+            "SELECT DISTINCT season FROM eo.group_season WHERE site = %s AND index = %s AND area = %s ORDER BY 1",
+            (site, index, area)).fetchall()]
         rows = conn.execute(
             "SELECT season, code_group, parcels, ha, status FROM eo.group_season WHERE site = %s AND index = %s "
             "AND area = %s", (site, index, area)).fetchall()
     if not seasons:
-        raise HTTPException(404, _NO_SERIES)
+        raise HTTPException(404, no_series)
     # Default: the latest season whose RPG is published (else the latest season)
     season = season or max((s for s in seasons if s <= max(years_rpg)), default=seasons[-1])
     known = [r for r in rows if r["code_group"]]
@@ -221,21 +239,12 @@ def crops(index: str = "ndvi", area: str | None = None, season: int | None = Non
             "permanent_groups": sorted(pc.PERMANENT_GROUPS, key=int), "min_clear": settings.s2_parcel_min_clear}
 
 
-@router.get("/crop")
-def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, weight: str = "pixels",
-         ref_area: str | None = None) -> dict:
-    """Curve of a crop group in an area for a season (mean of its parcels' daily curves), the
-    observations behind it, and the 3-year, 5-year and long-term references of the seasons before.
-
-    ``weight``: ``pixels`` (each parcel weighted by its interior pixels, the area measured) or
-    ``parcel`` (one parcel, one vote). ``ref_area``: area whose earlier seasons give the references
-    (default: the same area), e.g. the farm's plots compared with the whole group.
-    """
+def crop_payload(site: str, index: str, group: str, season: int, area: str, weight: str,
+                 ref_area: str | None) -> tuple[dict, dict | None]:
+    """Curve of a crop group in an area for a season and its references (also for MODIS), and the
+    season's group entry (None when the group has no curve this season)."""
     if weight not in ("pixels", "parcel"):
         raise HTTPException(422, "weight must be pixels or parcel")
-    _check_index(index)
-    site = _site()
-    area = area or site
     by_season = pc.group_curves(site, index, area, group, weighted=weight == "pixels")
     ref_area = ref_area or area
     by_ref = by_season if ref_area == area else pc.group_curves(site, index, ref_area, group,
@@ -254,34 +263,67 @@ def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, 
                         **({"p10": pc.nan_list(r["p10"]), "p90": pc.nan_list(r["p90"])} if "p10" in r else {})}
                     for k, r in refs.items()},
            "current": None, "observations": [], "comparison": None}
-    if season > max(years_rpg) and group not in pc.PERMANENT_GROUPS:
-        out["note"] = (f"RPG {season} is not published yet: the {season} crops are unknown, "
-                       "except permanent ones (taken from the latest RPG).")
     cur = by_season.get(season)
+    if season > max(years_rpg) and group not in pc.PERMANENT_GROUPS and not (cur and cur["status"] == "farm"):
+        out["note"] = (f"RPG {season} is not published yet: the {season} crops are unknown, "
+                       "except permanent ones (taken from the latest RPG) and the farm's plots kept unchanged.")
     if cur is None:
-        return out
+        return out, None
     out["current"] = {"mean": pc.nan_list(cur["mean"]), "q25": pc.nan_list(cur["q25"]),
                       "q75": pc.nan_list(cur["q75"]), "count": [int(c) for c in cur["count"]],
                       "parcels": cur["parcels"], "ha": round(cur["ha"], 1), "status": cur["status"]}
     out["comparison"] = pc.compare(cur["mean"], refs, means, season)
+    return out, cur
+
+
+@router.get("/crops")
+def crops(index: str = "ndvi", area: str | None = None, season: int | None = None) -> dict:
+    """Seasons with parcel curves, and the crop groups of an area in a season (parcels, area)."""
+    _check_index(index)
+    site = _site()
+    return crops_payload(site, index, area or site, season, _NO_SERIES)
+
+
+@router.get("/crop")
+def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, weight: str = "pixels",
+         ref_area: str | None = None) -> dict:
+    """Curve of a crop group in an area for a season (mean of its parcels' daily curves), the
+    observations behind it, and the 3-year, 5-year and long-term references of the seasons before.
+
+    ``weight``: ``pixels`` (each parcel weighted by its interior pixels, the area measured) or
+    ``parcel`` (one parcel, one vote). ``ref_area``: area whose earlier seasons give the references
+    (default: the same area), e.g. the farm's plots compared with the whole group.
+    """
+    _check_index(index)
+    site = _site()
+    area = area or site
+    out, cur = crop_payload(site, index, group, season, area, weight, ref_area)
+    if cur is None:
+        return out
     # Observations: per date, mean of the group's clear parcels (those with a curve this season)
+    years_rpg = pc.rpg_years()
     gy = pc.geometry_year(season, years_rpg)
     with connect() as conn:
         rows = conn.execute(
             f"""SELECT s.date, {"sum(s.mean * s.n_pixels) / sum(s.n_pixels)" if weight == "pixels" else "avg(s.mean)"}
                       AS mean, count(*) AS n
                FROM eo.parcel_stats s
-               JOIN eo.parcel_season c ON c.site = s.site AND c.season = %(season)s AND c.index = s.index
+               JOIN eo.parcel_season c ON c.site = %(site)s AND c.season = %(season)s AND c.index = s.index
                                       AND c.parcel_id = s.parcel_id AND c.rpg_year = s.rpg_year
-               JOIN eo.parcel_info i ON i.site = s.site AND i.rpg_year = s.rpg_year AND i.parcel_id = s.parcel_id
-               WHERE s.site = %(site)s AND s.index = %(index)s AND s.rpg_year = %(gy)s
+               JOIN eo.parcel_info i ON i.site = %(site)s AND i.rpg_year = s.rpg_year AND i.parcel_id = s.parcel_id
+               LEFT JOIN eo.farm_crop fc ON fc.site = %(site)s AND fc.season = %(season)s AND fc.rpg_year = s.rpg_year
+                                        AND fc.parcel_id = s.parcel_id
+               WHERE s.site_id = meta.site_key_of(%(site)s) AND s.index = %(index)s AND s.rpg_year IN (%(gy)s, %(farm_layer)s)
                  AND s.date BETWEEN %(d0)s AND %(d1)s AND s.n_clear >= %(min_clear)s * s.n_pixels
-                 AND i.code_group = %(group)s AND %(area)s = ANY(i.areas)
-                 AND (i.rpg_year = %(season)s OR i.code_group = ANY(%(permanent)s))
+                 AND %(area)s = ANY(i.areas)
+                 AND (%(area)s <> 'farm' OR fc.parcel_id IS NOT NULL OR NOT %(farm_lc)s)
+                 AND CASE WHEN fc.parcel_id IS NOT NULL THEN fc.code_group = %(group)s      -- the farm's crop
+                          ELSE i.code_group = %(group)s AND (i.rpg_year = %(season)s OR i.code_group = ANY(%(permanent)s)) END
                GROUP BY s.date ORDER BY s.date""",
             {"site": site, "index": index, "gy": gy, "season": season, "group": group, "area": area,
              "d0": pc.season_start(season), "d1": pc.season_end(season), "min_clear": settings.s2_parcel_min_clear,
-             "permanent": sorted(pc.PERMANENT_GROUPS)},
+             "permanent": sorted(pc.PERMANENT_GROUPS), "farm_lc": bool(pc.farm_years(site)),
+             "farm_layer": pc.FARM_LAYER},
         ).fetchall()
     need = max(1, min(3, round(0.3 * cur["parcels"])))
     out["observations"] = [{"date": str(r["date"]), "day": pc.day_of_season(r["date"], season),
@@ -292,9 +334,9 @@ def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, 
 
 @router.get("/parcel")
 def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = None) -> dict:
-    """History of the parcel at a point: for each season, the RPG parcel there, its crop and curve
-    metrics; for the selected season, its curve, observations and outline, and the mean of its own
-    earlier seasons with the same crop group."""
+    """History of the parcel at a point: for each season, the RPG parcel there (or the farm's field, in
+    the seasons of its land cover), its crop and curve metrics; for the selected season, its curve,
+    observations and outline, and the mean of its own earlier seasons with the same crop group."""
     import datetime as dt
     import json
 
@@ -313,11 +355,25 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
                ORDER BY year, surf_ha DESC NULLS LAST""", (lon, lat)).fetchall()}
         if not all_seasons:
             raise HTTPException(404, _NO_SERIES)
-        if not found:
+        # The farm's own fields at the point, year by year (their own series)
+        farm = {}
+        for r in conn.execute(
+                """SELECT year, field_id, plot, code_group, code_cultu, crop_label, surf_ha, ST_AsGeoJSON(geom, 6) AS g
+                   FROM ref.farm_landcover
+                   WHERE site = %s AND code_group IS NOT NULL
+                     AND ST_Intersects(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
+                   ORDER BY year, surf_ha DESC NULLS LAST""", (site, lon, lat)).fetchall():
+            farm.setdefault(r["year"], r)
+        if not found and not farm:
             raise HTTPException(404, "No RPG parcel at this point")
-        # The curve of each season: that season's RPG parcel at the point
-        wanted = [(s, found[gy]["parcel_id"], gy) for s in all_seasons
-                  if (gy := pc.geometry_year(s, years_rpg)) in found]
+        # The curve of each season: the farm's field of the season, else that season's RPG parcel
+        wanted = []
+        for s in all_seasons:
+            gy = pc.geometry_year(s, years_rpg)
+            if s in farm:
+                wanted.append((s, farm[s]["field_id"], pc.FARM_LAYER))
+            elif gy in found:
+                wanted.append((s, found[gy]["parcel_id"], gy))
         stored = {r["season"]: r for r in conn.execute(
             """SELECT c.season, c.n_obs, c.peak, c.peak_date, c.curve, i.areas
                FROM eo.parcel_season c
@@ -329,17 +385,28 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
     for s in all_seasons:
         gy = pc.geometry_year(s, years_rpg)
         f = found.get(gy)
-        if f is None:
+        lc = farm.get(s)
+        if f is None and lc is None:
             history.append({"season": s, "rpg_year": gy, "status": "none"})
             continue
-        status = pc.crop_status(s, gy, f["code_group"])
+        f = f or {"parcel_id": None, "code_group": None, "code_cultu": None, "surf_ha": None, "bio": None}
+        group, cultu, status = pc.effective_crop(s, gy, f["code_group"], f["code_cultu"],
+                                                 (lc["code_group"], lc["code_cultu"]) if lc else None)
         known = status != "unknown"
+        if status == "farm":
+            crop = lc["crop_label"] or crops_l.get((max(years_rpg), cultu)) or glabels.get(group, group)
+        else:
+            crop = crops_l.get((gy, cultu), cultu) if known else None
         e = {"season": s, "rpg_year": gy, "parcel_id": f["parcel_id"], "status": status,
-             "code_cultu": f["code_cultu"] if known else None,
-             "crop": crops_l.get((gy, f["code_cultu"]), f["code_cultu"]) if known else None,
-             "code_group": f["code_group"] if known else None,
-             "group_label": glabels.get(f["code_group"]) if known else None,
-             "last_known_group": f["code_group"], "surf_ha": f["surf_ha"], "bio": f["bio"]}
+             "code_cultu": cultu if known else None, "crop": crop,
+             "code_group": group if known else None,
+             "group_label": glabels.get(group) if known else None,
+             "rpg_crop": crops_l.get((gy, f["code_cultu"]), f["code_cultu"])
+             if status == "farm" and s == gy and f["code_cultu"] and f["code_cultu"] != cultu else None,
+             "last_known_group": f["code_group"] or group, "surf_ha": f["surf_ha"], "bio": f["bio"]}
+        if lc is not None:                 # the farm's field: its own outline and series
+            e |= {"rpg_year": pc.FARM_LAYER, "parcel_id": lc["field_id"], "field": lc["plot"], "unit": "field",
+                  "surf_ha": round(float(lc["surf_ha"]), 2) if lc["surf_ha"] is not None else None}
         r = stored.get(s)
         if r is not None:
             curves[s] = np.frombuffer(r["curve"], dtype="<f4")
@@ -349,6 +416,17 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
         history.append(e)
     if not curves:
         raise HTTPException(404, "No clear observation of this parcel")
+    # Before the parcels (2015), the RPG îlot at the point and its majority crop group
+    with connect() as conn:
+        ilots = conn.execute(
+            """SELECT DISTINCT ON (year) year, ilot_id, code_group, surf_ha, group_ha FROM ref.rpg_ilot
+               WHERE ST_Intersects(geom, ST_SetSRID(ST_MakePoint(%s, %s), 4326)) AND year < %s
+               ORDER BY year, surf_ha DESC NULLS LAST""", (lon, lat, min(years_rpg))).fetchall()
+    history = [{"season": r["year"], "rpg_year": r["year"], "status": "ilots", "parcel_id": r["ilot_id"],
+                "code_group": r["code_group"], "group_label": glabels.get(r["code_group"], r["code_group"]),
+                "crop": glabels.get(r["code_group"], r["code_group"]), "surf_ha": r["surf_ha"],
+                "share": None if not r["group_ha"] or not r["surf_ha"] else round(min(r["group_ha"] / r["surf_ha"], 1), 2)}
+               for r in ilots] + history
     this_year = dt.date.today().year      # default: the season harvested this year
     season = season if season in curves else (this_year if this_year in curves else max(curves))
     sel = next(e for e in history if e["season"] == season)
@@ -356,7 +434,7 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
     with connect() as conn:
         obs = conn.execute(
             """SELECT date, mean, std, n_clear, n_pixels FROM eo.parcel_stats
-               WHERE site = %s AND index = %s AND rpg_year = %s AND parcel_id = %s AND date BETWEEN %s AND %s
+               WHERE site_id = meta.site_key_of(%s) AND index = %s AND rpg_year = %s AND parcel_id = %s AND date BETWEEN %s AND %s
                ORDER BY date""",
             (site, index, gy, sel["parcel_id"], pc.season_start(season), pc.season_end(season))).fetchall()
     group = sel["code_group"] or sel["last_known_group"]
@@ -365,7 +443,8 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
     out = {"site": site, "index": index, "point": [lon, lat], **_season_info(season),
            "min_clear": settings.s2_parcel_min_clear, "history": history, "parcel": sel,
            "reference_group": group, "reference_group_label": glabels.get(group, group),
-           "geometry": json.loads(found[gy]["g"]), "curve": pc.nan_list(curves[season]),
+           "geometry": json.loads(farm[season]["g"] if sel.get("unit") == "field" else found[gy]["g"]),
+           "curve": pc.nan_list(curves[season]),
            "observations": [{"date": str(o["date"]), "day": pc.day_of_season(o["date"], season),
                              "mean": round(float(o["mean"]), 3), "std": round(float(o["std"] or 0), 3),
                              "clear_fraction": round(o["n_clear"] / o["n_pixels"], 3),

@@ -67,3 +67,23 @@ def test_wanted_bands_always_include_ndvi_and_scl():
     bands = s2.wanted_bands()
     assert {"B04", "B08"} <= set(bands) and bands[-1] == "SCL"
     assert s2.available_indices({"B04", "B08", "B05"}) == ["ndvi", "ndre"]
+
+
+def test_two_pass_requests_only_runs_of_clear_new_dates():
+    from geomon.ingest import sentinel2 as ing
+
+    d = [np.datetime64(f"2026-10-{k:02d}") for k in (1, 2, 4, 14, 17, 19, 21, 27, 29, 31)]
+    keep = {d[0], d[2], d[3], d[4], d[5], d[7], d[9]}                   # 02, 21 and 29 too cloudy
+    assert ing.runs_of(d, keep) == [(d[0], d[0]), (d[2], d[5]), (d[7], d[7]), (d[9], d[9])]
+    scl = xr.Dataset({"SCL": (("time", "y", "x"), np.array([[[4, 4], [9, 9]], [[8, 9], [9, 9]]], "uint8"))},
+                     coords={"time": d[:2], "y": [1.0, 0.0], "x": [0.0, 1.0]})
+    fr = ing.clear_dates(scl, np.ones((2, 2), bool))
+    assert fr == {d[0]: 0.5, d[1]: 0.0}
+
+
+def test_store_encoding_is_sharded_per_date():
+    from geomon.ingest import sentinel2 as ing
+
+    ds = xr.Dataset({"B04": (("time", "y", "x"), np.zeros((2, 700, 1100), "int16"))})
+    enc = ing._encoding(ds)["B04"]
+    assert enc["chunks"] == (1, 512, 512) and enc["shards"] == (1, 1024, 1536)

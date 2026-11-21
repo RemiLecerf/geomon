@@ -17,7 +17,6 @@ features into ref.osm_feature.
 from __future__ import annotations
 
 import datetime as dt
-import email.utils
 import logging
 import os
 import re
@@ -28,37 +27,9 @@ from pathlib import Path
 from ..aoi import AOI
 from ..config import settings
 from ..db import connect
-from ..http import session
+from ..http import cached_download, is_fresh, session
 
 log = logging.getLogger(__name__)
-
-
-def _download(url: str, dest: Path, max_age_days: int) -> Path:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        age = (time.time() - dest.stat().st_mtime) / 86400
-        if age <= max_age_days:
-            log.info("OSM extract %s is %.1f days old: reusing it", dest.name, age)
-            return dest
-    log.info("Downloading %s", url)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    with session().get(url, stream=True, timeout=600) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0))
-        done, next_report = 0, 0.0
-        with open(tmp, "wb") as fh:
-            for block in r.iter_content(chunk_size=4 << 20):
-                fh.write(block)
-                done += len(block)
-                if total and done / total >= next_report:
-                    log.info("  %3.0f%% of %.0f MB", 100 * done / total, total / 1e6)
-                    next_report += 0.1
-        last_modified = r.headers.get("Last-Modified")
-    os.replace(tmp, dest)
-    if last_modified:
-        ts = email.utils.parsedate_to_datetime(last_modified).timestamp()
-        os.utime(dest, (ts, ts))
-    return dest
 
 
 # Tags kept, matching _CLASSIFY_SQL. Relations are limited to multipolygons;
@@ -80,11 +51,9 @@ out body;
 
 def _overpass(aoi: AOI, dest: Path, max_age_days: int) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        age = (time.time() - dest.stat().st_mtime) / 86400
-        if age <= max_age_days:
-            log.info("Overpass response %s is %.1f days old: reusing it", dest.name, age)
-            return dest
+    if is_fresh(dest, max_age_days):
+        log.info("Overpass response %s is less than %d days old: reusing it", dest.name, max_age_days)
+        return dest
     w, s_, e, n = aoi.bbox_wgs84
     query = _OVERPASS_QUERY.format(
         timeout=settings.overpass_timeout_s, s=f"{s_:.6f}", w=f"{w:.6f}", n=f"{n:.6f}", e=f"{e:.6f}"
@@ -181,7 +150,7 @@ def run(aoi: AOI) -> dict:
     raw = settings.raw_dir / "osm"
     if settings.osm_source == "geofabrik":
         url = settings.osm_pbf_url
-        src = _download(url, raw / Path(url).name, settings.osm_max_age_days)
+        src, _ = cached_download(url, raw / Path(url).name, settings.osm_max_age_days, server_time=True)
     elif settings.osm_source == "overpass":
         src = _overpass(aoi, raw / f"overpass_{aoi.code}.osm", settings.osm_max_age_days)
     else:

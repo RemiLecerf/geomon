@@ -232,6 +232,9 @@ def area_zones(ds: xr.Dataset, areas: dict[str, dict], partition: set[str] = fro
     and split by label: memory grows with the site's pixels, not with the number of communes
     (one boolean image per commune of a département would take tens of GB). The other areas (the
     site, the farm) get one mask each.
+
+    An area too small to hold a pixel centre (a farm on a 250 m or 1 km grid) gets the pixel under
+    its representative point, so that it still has values.
     """
     from rasterio.features import rasterize
     from shapely.geometry import mapping, shape
@@ -250,7 +253,41 @@ def area_zones(ds: xr.Dataset, areas: dict[str, dict], partition: set[str] = fro
             zones[c] = order[bounds[k + 1]:bounds[k + 2]]
     for c, m in area_masks(ds, {c: g for c, g in areas.items() if c not in partition}).items():
         zones[c] = np.flatnonzero(m.ravel()).astype("int32")
+    for c, z in zones.items():
+        if z.size:
+            continue
+        p = shape(areas[c]).representative_point()
+        col, row = (int(np.floor(v)) for v in ~aff * to_grid(p.x, p.y))
+        if 0 <= row < out_shape[0] and 0 <= col < out_shape[1]:
+            zones[c] = np.array([row * out_shape[1] + col], dtype="int32")
     return zones
+
+
+def grid_key(ds: xr.Dataset) -> tuple:
+    """What identifies a store's grid (shape, cell corners, CRS): the key of cached zones."""
+    shape_, aff = _grid(ds)
+    return shape_, tuple(aff)[:6], crs_of(ds)
+
+
+_SITE_ZONES: dict[tuple, tuple[float, dict]] = {}
+SITE_ZONES_TTL_S = 600          # the site's areas (meta.aoi) are read again after this
+
+
+def site_zones(ds: xr.Dataset, site: str) -> dict[str, np.ndarray]:
+    """The pixels of every area of a site on a store's grid (see :func:`area_zones`), cached per
+    site and grid."""
+    import time
+
+    from .aoi import site_areas
+
+    key = (site, grid_key(ds))
+    hit = _SITE_ZONES.get(key)
+    if hit is None or time.monotonic() - hit[0] > SITE_ZONES_TTL_S:
+        if len(_SITE_ZONES) > 32:
+            _SITE_ZONES.clear()
+        areas, communes = site_areas(site)
+        hit = _SITE_ZONES[key] = (time.monotonic(), area_zones(ds, areas, communes))
+    return hit[1]
 
 
 def area_stats_parts(pieces: list[tuple[xr.Dataset, dict[str, np.ndarray]]], n_area: dict[str, int],

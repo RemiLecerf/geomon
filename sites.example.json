@@ -9,6 +9,11 @@
     "name": "Chartres et voisines",
     "communes": ["28085", "28218", "28229"],
     "farm_file": "farm/chartres-3/plots.geojson",
-    "farm_name": "My plots"
+    "farm_name": "My plots",
+    "farm_landcover": {
+      "2024": "farm/chartres-3/landcover_2024.shp",
+      "2025": {"path": "farm/chartres-3/landcover_2025.gpkg", "layer": "fields", "crop_field": "CULTURE"},
+      "2026": "farm/chartres-3/landcover_2025.gpkg"
+    }
   }
 ]

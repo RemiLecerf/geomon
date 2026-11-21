@@ -3,17 +3,16 @@
     python -m geomon.scheduler            # runs until stopped (compose service "scheduler")
     python -m geomon.scheduler --status   # last runs and next checks
 
-Each source is fetched when it publishes, not more often:
+Each source is fetched when it publishes, not more often: every dataset of geomon.datasets with a
+``schedule`` is checked on it (see :func:`job_of`: a period, a daily time, a new forecast run or a
+new satellite acquisition), and its steps read only what is new. ``--status`` lists the jobs
+with their last runs.
 
-| Job       | Step(s)  | Published                                     | Checked                  |
-|-----------|----------|-----------------------------------------------|--------------------------|
-| forecast  | forecast | AROME every 3 h, ARPEGE and ECMWF every 6 h   | every 15 min (run times) |
-| history   | weather  | Météo-France archive: daily                   | daily, 02:00 UTC         |
-| sim2      | sim2     | Météo-France "latest" file: daily             | every 6 h                |
-| agera5    | agera5   | Copernicus CDS: daily, ~10 days behind        | every 6 h                |
-| era5land  | era5land | Copernicus CDS: daily, ~10 days behind        | every 6 h                |
-| era5      | era5     | Copernicus CDS: daily, ~10 days behind        | every 6 h                |
-| sentinel2 | sentinel2| L2A scenes, ~5 h after acquisition           | every 3 h (STAC catalogue)|
+Each site follows the mode chosen for each dataset on the page's Data tab (geomon.datasets): a
+job only updates the sites where one of its datasets is in "update" or "live" mode; the static
+datasets ("refresh-*" jobs) are refreshed only in "update" mode (by default they are frozen). The
+actions asked from the page (update now, delete the stored data) are run by a thread of the
+scheduler, one at a time.
 
 The forecast job reads Open-Meteo's model metadata (a few hundred bytes per
 model) and only downloads a forecast when one of the models has a new run.
@@ -49,10 +48,12 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from . import datasets
 from .aoi import resolve_aoi, save_aoi
 from .config import all_sites, settings, use_site
 from .http import session
 from .ingest.__main__ import run_step
+from .ingest.lock import ingest_lock, lock_group
 
 log = logging.getLogger("geomon.scheduler")
 
@@ -133,75 +134,103 @@ def new_forecast_run(st: dict, now: dt.datetime) -> bool:
     return last is None or marker is None or marker != st.get("marker")
 
 
-STAC_ITEMS = "https://stac.dataspace.copernicus.eu/v1/collections/sentinel-2-l2a/items"
+STAC = "https://stac.dataspace.copernicus.eu/v1/collections/{}/items"
+STAC_ITEMS = STAC.format("sentinel-2-l2a")
 
 
-def _clear_enough(feature: dict) -> bool:
-    return (feature["properties"].get("eo:cloud_cover") or 0) <= settings.s2_max_cloud
-
-
-def newest_scene(bbox: str, since: str) -> str | None:
-    """Acquisition time of the newest L2A scene over ``bbox`` since ``since`` whose tile cloud cover
-    is at most GEOMON_S2_MAX_CLOUD.
+def newest_scene(bbox: str, since: str, collection: str = "sentinel-2-l2a",
+                 max_cloud: float | None = None) -> str | None:
+    """Acquisition time of the newest scene of a STAC collection over ``bbox`` since ``since``;
+    for Sentinel-2, whose tile cloud cover is at most GEOMON_S2_MAX_CLOUD (``max_cloud``; None:
+    no cloud filter, as for the radar of Sentinel-1).
 
     The catalogue sorts and filters: one item is transferred. A server without the sort or filter
     extensions (HTTP 4xx) is paged through instead, every item read."""
+    if collection == "sentinel-2-l2a" and max_cloud is None:
+        max_cloud = settings.s2_max_cloud
+    items = STAC.format(collection)
+
+    def wanted(f: dict) -> bool:
+        return max_cloud is None or (f["properties"].get("eo:cloud_cover") or 0) <= max_cloud
+
     params = {"bbox": bbox, "datetime": f"{since}/.."}
-    r = session().get(STAC_ITEMS, timeout=60, params=params | {
-        "limit": 1, "sortby": "-properties.datetime",
-        "filter": f"eo:cloud_cover<={settings.s2_max_cloud:g}", "filter-lang": "cql2-text"})
+    query = {"limit": 1, "sortby": "-properties.datetime"}
+    if max_cloud is not None:
+        query |= {"filter": f"eo:cloud_cover<={max_cloud:g}", "filter-lang": "cql2-text"}
+    r = session().get(items, timeout=60, params=params | query)
     if r.status_code < 400:
-        feats = [f for f in r.json().get("features", []) if _clear_enough(f)]
+        feats = [f for f in r.json().get("features", []) if wanted(f)]
         return feats[0]["properties"]["datetime"] if feats else None
     if r.status_code >= 500:
         r.raise_for_status()
     log.debug("STAC search without sort/filter (%s): paging through the items", r.status_code)
     times: list[str] = []
-    url, query = STAC_ITEMS, params | {"limit": 100}
+    url, page_query = items, params | {"limit": 100}
     for _ in range(50):                    # at most 5,000 items
-        r = session().get(url, params=query, timeout=60)
+        r = session().get(url, params=page_query, timeout=60)
         r.raise_for_status()
         page = r.json()
-        times += [f["properties"]["datetime"] for f in page.get("features", []) if _clear_enough(f)]
+        times += [f["properties"]["datetime"] for f in page.get("features", []) if wanted(f)]
         url = next((link["href"] for link in page.get("links", []) if link.get("rel") == "next"), None)
         if not url:
             break
-        query = None                       # the next link carries the query
+        page_query = None                  # the next link carries the query
     return max(times) if times else None
 
 
-def latest_s2_scene() -> str | None:
-    """Acquisition time of the newest L2A scene over the current site below the cloud threshold."""
+def _site_bbox() -> str | None:
     from .db import connect
 
     with connect() as conn:
         row = conn.execute("""SELECT ST_XMin(bbox) x0, ST_YMin(bbox) y0, ST_XMax(bbox) x1, ST_YMax(bbox) y1
                               FROM meta.aoi WHERE kind = 'site' AND code = %s""", (settings.site_code,)).fetchone()
-    if not row:
-        return None
-    since = (_now() - dt.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return newest_scene(f"{row['x0']},{row['y0']},{row['x1']},{row['y1']}", since)
+    return f"{row['x0']},{row['y0']},{row['x1']},{row['y1']}" if row else None
 
 
-def new_s2_scene(st: dict, now: dt.datetime) -> bool:
-    marker = latest_s2_scene()
-    st["pending_marker"] = marker
-    if _parse(st.get("last_ok")) is None:
-        return True
-    return marker is not None and marker != st.get("marker")
+def _new_scene(collection: str):
+    """Trigger: a newer acquisition of the collection over the current site (last 30 days)."""
+    def due(st: dict, now: dt.datetime) -> bool:
+        bbox = _site_bbox()
+        since = (_now() - dt.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        marker = newest_scene(bbox, since, collection) if bbox else None
+        st["pending_marker"] = marker
+        if _parse(st.get("last_ok")) is None:
+            return True
+        return marker is not None and marker != st.get("marker")
+    return due
 
 
-JOBS = [
-    Job("forecast", ["forecast"], "new AROME/ARPEGE/ECMWF run (checked every 15 min)",
-        new_forecast_run, dt.timedelta(minutes=15)),
-    Job("history", ["weather"], "Météo-France archive, daily at 02:00 UTC", daily(2, 0)),
-    Job("sim2", ["sim2"], "SIM2 latest file, every 6 h", every(dt.timedelta(hours=6))),
-    Job("agera5", ["agera5"], "AgERA5, every 6 h", every(dt.timedelta(hours=6))),
-    # The steps only send a CDS request when a new day is published
-    Job("era5land", ["era5land"], "ERA5-Land (CDS), every 6 h", every(dt.timedelta(hours=6))),
-    Job("era5", ["era5"], "ERA5 (CDS), every 6 h", every(dt.timedelta(hours=6))),
-    Job("sentinel2", ["sentinel2"], "new Sentinel-2 scene (STAC catalogue checked every 3 h for each site)",
-        new_s2_scene, dt.timedelta(hours=3), per_site=True),
+
+
+def job_of(d: datasets.Dataset) -> Job:
+    """The scheduler job of a dataset, from its ``schedule``; its steps decide themselves whether
+    there is anything new to read (a new image, run or day)."""
+    sc, check_every, per_site = d.schedule, dt.timedelta(minutes=1), False
+    if isinstance(sc, datasets.Every):
+        period = dt.timedelta(minutes=sc.minutes, hours=sc.hours, days=sc.days)
+        text, due = f"every {_human(period)}", every(period)
+    elif isinstance(sc, datasets.Daily):
+        text, due = f"daily at {sc.hour:02d}:{sc.minute:02d} UTC", daily(sc.hour, sc.minute)
+    elif isinstance(sc, datasets.NewRun):
+        text, due, check_every = "each new model run (checked every 15 min)", new_forecast_run, dt.timedelta(minutes=15)
+    elif isinstance(sc, datasets.NewScene):
+        text, due, check_every, per_site = ("each new acquisition (STAC catalogue checked every 3 h for each site)",
+                                            _new_scene(sc.collection), dt.timedelta(hours=3), True)
+    else:
+        raise ValueError(f"{d.code}: unknown schedule {sc!r}")
+    return Job(d.scheduled_job(), list(d.steps), f"{d.label}, {text}", due, check_every, per_site)
+
+
+def _human(period: dt.timedelta) -> str:
+    m = int(period.total_seconds() // 60)
+    return f"{m // 1440} days" if m % 1440 == 0 else f"{m // 60} h" if m % 60 == 0 else f"{m} min"
+
+
+JOBS = [job_of(d) for d in datasets.DATASETS.values() if d.schedule] + [
+    # Static datasets: refreshed only for the sites where they are in "update" mode
+    Job(d.scheduled_job(), list(d.steps), f"{d.label}, every {d.refresh_days} days (update mode)",
+        every(dt.timedelta(days=d.refresh_days)), dt.timedelta(minutes=10))
+    for d in datasets.DATASETS.values() if d.refresh_days and not d.schedule
 ]
 
 
@@ -318,7 +347,15 @@ def _run_site(job: Job, code: str, sst: dict) -> bool:
 def run_job(job: Job, state: dict) -> None:
     """Checks a job's trigger once and updates the sites that need it."""
     now = _now()
-    sites = [s.code for s in all_sites()]
+    sites = []
+    for s in all_sites():
+        try:
+            if datasets.scheduled(s.code, job.name):     # the modes chosen on the page's Data tab
+                sites.append(s.code)
+        except Exception as exc:
+            log.warning("%s %s: dataset modes not read (%s)", s.code, job.name, exc)
+    if not sites:
+        return
     with _state_lock:
         js = state["jobs"].setdefault(job.name, {})
         site_states = {c: state["sites"].setdefault(c, {}).setdefault(job.name, {}) for c in sites}
@@ -373,6 +410,48 @@ def run_job(job: Job, state: dict) -> None:
     save_state(state)
 
 
+# ---------------------------------------------------------------------------
+# Actions asked from the page (meta.dataset_request)
+# ---------------------------------------------------------------------------
+def run_request(req: dict) -> tuple[bool, str]:
+    d = datasets.DATASETS.get(req["dataset"])
+    if d is None:
+        return False, f"unknown dataset {req['dataset']}"
+    with use_site(req["site"]):
+        if req["action"] == "delete":
+            with ingest_lock(lock_group(d.steps[0])):
+                r = datasets.delete(req["site"], d.code)
+            return True, f"{len(r['removed'])} stores and {r['rows']} rows removed"
+        aoi = _aoi(req["site"])
+        failed = [step for step in d.steps if not run_step(step, aoi)]
+        return (not failed, "failed: " + ", ".join(failed) if failed else "updated")
+
+
+def request_loop(once: bool) -> None:
+    try:
+        datasets.reset_stale_requests()
+    except Exception as exc:
+        log.warning("Dataset requests not reset: %s", exc)
+    while not _stop:
+        try:
+            req = datasets.next_request()
+        except Exception as exc:
+            log.warning("Dataset requests not read: %s", exc)
+            req = None
+        if req is None:
+            if once:
+                return
+            _sleep(10)
+            continue
+        log.info("Request %s: %s %s for %s", req["id"], req["action"], req["dataset"], req["site"])
+        try:
+            ok, message = run_request(req)
+        except Exception as exc:
+            log.exception("Request %s failed", req["id"])
+            ok, message = False, str(exc)
+        datasets.finish_request(req["id"], ok, message)
+
+
 def job_loop(job: Job, state: dict, once: bool) -> None:
     while not _stop:
         try:
@@ -413,8 +492,11 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Sites: %s", ", ".join(s.code for s in all_sites()))
     state = load_state()
     save_state(state)
+    from .migrate import migrate
+    migrate()                     # the dataset modes are read at the first tick, before any AOI is saved
     threads = [threading.Thread(target=job_loop, args=(job, state, args.once), name=job.name, daemon=True)
                for job in JOBS]
+    threads.append(threading.Thread(target=request_loop, args=(args.once,), name="requests", daemon=True))
     for t in threads:
         t.start()
     while any(t.is_alive() for t in threads):

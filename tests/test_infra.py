@@ -41,6 +41,14 @@ def test_sites_file(tmp_path, monkeypatch):
     config._SITES_CACHE.clear()
 
 
+def test_netcdf_backend_is_installed(tmp_path):
+    """openEO (Sentinel), the CDS (ERA5, AgERA5) deliver NetCDF, read with h5netcdf (needs h5py)."""
+    path = tmp_path / "x.nc"
+    xr.Dataset({"v": ("t", np.arange(3.0))}).to_netcdf(path, engine="h5netcdf")
+    with xr.open_dataset(path, engine="h5netcdf") as ds:
+        assert ds["v"].values.tolist() == [0.0, 1.0, 2.0]
+
+
 def test_write_atomic_replaces_a_store(tmp_path):
     path = tmp_path / "w" / "p.zarr"
     zarrio.write_atomic(xr.Dataset({"v": ("t", np.arange(3.0))}), path)

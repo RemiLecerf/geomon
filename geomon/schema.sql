@@ -81,6 +81,22 @@ CREATE INDEX IF NOT EXISTS rpg_parcel_geom_idx ON ref.rpg_parcel USING gist (geo
 CREATE INDEX IF NOT EXISTS rpg_parcel_year_idx ON ref.rpg_parcel (year);
 CREATE INDEX IF NOT EXISTS rpg_parcel_year_id_idx ON ref.rpg_parcel (year, parcel_id);
 
+-- RPG 2007-2014 (RPG 1.0): only the farms' îlots (blocks of contiguous parcels of one farm), each
+-- with its majority crop group, no parcel or crop
+CREATE TABLE IF NOT EXISTS ref.rpg_ilot (
+    id           bigserial PRIMARY KEY,
+    year         int  NOT NULL,
+    ilot_id      text,
+    code_group   text,                    -- majority crop group (the codes of the parcels' groups)
+    group_label  text,
+    surf_ha      double precision,        -- graphic area of the îlot, ha
+    group_ha     double precision,        -- area of the majority group in the îlot (2010-2014 only), ha
+    commune      text,
+    geom         geometry(MultiPolygon, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rpg_ilot_geom_idx ON ref.rpg_ilot USING gist (geom);
+CREATE INDEX IF NOT EXISTS rpg_ilot_year_id_idx ON ref.rpg_ilot (year, ilot_id);
+
 -- ---------------------------------------------------------------------------
 -- The farm's own plots (a PAC declaration export), per site
 -- ---------------------------------------------------------------------------
@@ -100,6 +116,72 @@ CREATE INDEX IF NOT EXISTS farm_plot_geom_idx ON ref.farm_plot USING gist (geom)
 -- ---------------------------------------------------------------------------
 -- OpenStreetMap features (clipped to the AOI extent), per site
 -- ---------------------------------------------------------------------------
+-- The farm's land cover, one file per year (sites.json farm_landcover; the same file may serve several
+-- years): its plots or fields with their crop (RPG codes)
+CREATE TABLE IF NOT EXISTS ref.farm_landcover (
+    id          bigserial PRIMARY KEY,
+    site        text NOT NULL,
+    year        int  NOT NULL,
+    plot        text,
+    code_cultu  text,
+    code_group  text,
+    crop_label  text,
+    surf_ha     double precision,
+    source      text,                 -- the file
+    props       jsonb NOT NULL DEFAULT '{}'::jsonb,
+    geom        geometry(MultiPolygon, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS farm_landcover_geom_idx ON ref.farm_landcover USING gist (geom);
+CREATE INDEX IF NOT EXISTS farm_landcover_site_year_idx ON ref.farm_landcover (site, year);
+-- A field's id: 'F' and a hash of its outline (the same field in several years' files has one id, and
+-- one series); its Sentinel-2 statistics and curves are those of eo.parcel_* with rpg_year 0
+ALTER TABLE ref.farm_landcover ADD COLUMN IF NOT EXISTS field_id text;
+
+-- Soil and geology maps of a site (geomon.ingest.soil_maps): layer soils (Gis Sol dominant soils,
+-- RRP 1:250 000), geology (BRGM 1:50 000 harmonised), clay (BRGM clay shrink-swell exposure)
+CREATE TABLE IF NOT EXISTS ref.soil_feature (
+    id      bigserial PRIMARY KEY,
+    site    text NOT NULL,
+    layer   text NOT NULL,
+    code    text,                     -- class code (soil reference, geological notation, exposure level)
+    label   text,                     -- class label
+    detail  text,                     -- longer description (soil unit, formation)
+    color   text,                     -- display colour (#rrggbb)
+    props   jsonb NOT NULL DEFAULT '{}'::jsonb,
+    geom    geometry(MultiPolygon, 4326) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS soil_feature_geom_idx ON ref.soil_feature USING gist (geom);
+CREATE INDEX IF NOT EXISTS soil_feature_site_layer_idx ON ref.soil_feature (site, layer);
+
+-- Groundwater levels (Hub'Eau, piezometers of the ADES network): stations, daily levels, and the
+-- stations followed for each site
+CREATE TABLE IF NOT EXISTS ref.gw_station (
+    code_bss    text PRIMARY KEY,
+    name        text,
+    commune     text,
+    lon         double precision,
+    lat         double precision,
+    altitude_m  double precision,     -- ground level (NGF)
+    depth_m     double precision,     -- depth of the borehole
+    aquifers    text,                 -- groundwater bodies (masses d'eau)
+    first_date  date,
+    last_date   date,
+    props       jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE TABLE IF NOT EXISTS eo.gw_level (
+    code_bss   text NOT NULL,
+    date       date NOT NULL,
+    depth_m    real,                  -- depth of the water below ground
+    level_ngf  real,                  -- water level (m NGF)
+    PRIMARY KEY (code_bss, date)
+);
+CREATE TABLE IF NOT EXISTS ref.gw_site (
+    site         text NOT NULL,
+    code_bss     text NOT NULL,
+    distance_km  double precision,
+    PRIMARY KEY (site, code_bss)
+);
+
 CREATE TABLE IF NOT EXISTS ref.osm_feature (
     id        bigserial PRIMARY KEY,
     site      text,
@@ -170,6 +252,31 @@ JOIN ref.admin_unit a
  AND (a.valid_to IS NULL OR make_date(COALESCE(o.geo_vintage, a.vintage), 1, 1) < a.valid_to);
 
 -- ---------------------------------------------------------------------------
+-- Datasets: how each one is followed for a site (chosen on the page's Data tab, see
+-- geomon.datasets), and the actions asked from the page, run by the scheduler
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS meta.dataset_policy (
+    site        text NOT NULL,
+    dataset     text NOT NULL,
+    mode        text NOT NULL,            -- update, frozen or live
+    keep_hours  int,                      -- live: the hours kept
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (site, dataset)
+);
+CREATE TABLE IF NOT EXISTS meta.dataset_request (
+    id            bigserial PRIMARY KEY,
+    site          text NOT NULL,
+    dataset       text NOT NULL,
+    action        text NOT NULL,          -- update or delete
+    requested_at  timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz,
+    status        text NOT NULL DEFAULT 'pending',   -- pending, running, done, failed
+    message       text
+);
+CREATE INDEX IF NOT EXISTS dataset_request_pending_idx ON meta.dataset_request (status, requested_at);
+
+-- ---------------------------------------------------------------------------
 -- Ingestion log
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS meta.ingest_log (
@@ -200,9 +307,43 @@ CREATE TABLE IF NOT EXISTS eo.index_stats (
     PRIMARY KEY (site, area, index, date)
 );
 
+-- Sites as small integers in the largest tables (a site's name repeated in every row and in the key
+-- took 17 % of eo.parcel_stats). meta.site_id gives a site its id (adding it), meta.site_key_of only
+-- reads it (stable: computed once per query, the primary key usable).
+CREATE TABLE IF NOT EXISTS meta.site_key (
+    id    smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    site  text NOT NULL UNIQUE
+);
+CREATE OR REPLACE FUNCTION meta.site_id(s text) RETURNS smallint LANGUAGE sql AS $$
+    WITH added AS (INSERT INTO meta.site_key (site) VALUES (s) ON CONFLICT (site) DO NOTHING RETURNING id)
+    SELECT id FROM added UNION ALL SELECT id FROM meta.site_key WHERE site = s LIMIT 1
+$$;
+CREATE OR REPLACE FUNCTION meta.site_key_of(s text) RETURNS smallint LANGUAGE sql STABLE AS $$
+    SELECT id FROM meta.site_key WHERE site = s
+$$;
+
+-- An eo.parcel_stats keyed by the site's name (before version 10): moved to the site key
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'eo' AND table_name = 'parcel_stats' AND column_name = 'site') THEN
+        INSERT INTO meta.site_key (site) SELECT DISTINCT site FROM eo.parcel_stats ON CONFLICT DO NOTHING;
+        CREATE TABLE eo.parcel_stats_v10 (
+            site_id smallint NOT NULL, rpg_year int NOT NULL, parcel_id text NOT NULL, index text NOT NULL,
+            date date NOT NULL, mean real, std real, n_pixels int, n_clear int);
+        INSERT INTO eo.parcel_stats_v10
+            SELECT k.id, p.rpg_year, p.parcel_id, p.index, p.date, p.mean, p.std, p.n_pixels, p.n_clear
+            FROM eo.parcel_stats p JOIN meta.site_key k ON k.site = p.site;
+        DROP TABLE eo.parcel_stats;
+        ALTER TABLE eo.parcel_stats_v10 RENAME TO parcel_stats;
+        ALTER TABLE eo.parcel_stats ADD PRIMARY KEY (site_id, rpg_year, index, parcel_id, date);
+        ANALYZE eo.parcel_stats;
+    END IF;
+END $$;
+
 -- Per-date index statistics over each RPG parcel's interior (see geomon.parcels)
 CREATE TABLE IF NOT EXISTS eo.parcel_stats (
-    site       text NOT NULL,
+    site_id    smallint NOT NULL,      -- meta.site_key
     rpg_year   int  NOT NULL,          -- RPG year of the parcel outline
     parcel_id  text NOT NULL,          -- RPG id_parcel (unique within a year only)
     index      text NOT NULL,
@@ -211,7 +352,7 @@ CREATE TABLE IF NOT EXISTS eo.parcel_stats (
     std        real,
     n_pixels   int,                    -- interior pixels (outline shrunk by 10 m)
     n_clear    int,                    -- clear interior pixels with a valid index
-    PRIMARY KEY (site, rpg_year, index, parcel_id, date)
+    PRIMARY KEY (site_id, rpg_year, index, parcel_id, date)
 );
 
 -- Parcel-dates processed (also when no parcel was clear)
@@ -250,6 +391,20 @@ CREATE TABLE IF NOT EXISTS eo.parcel_info (
     bio         boolean,
     areas       text[] NOT NULL,       -- codes of the site's areas containing the parcel
     PRIMARY KEY (site, rpg_year, parcel_id)
+);
+ALTER TABLE eo.parcel_info DROP COLUMN IF EXISTS farm_group;    -- replaced by eo.farm_crop
+ALTER TABLE eo.parcel_info DROP COLUMN IF EXISTS farm_cultu;
+
+-- The crop the farm declared (ref.farm_landcover) for the RPG parcels of a season lying in its plots
+-- (the parcel's point on surface in a plot of the season's year): used instead of the RPG's
+CREATE TABLE IF NOT EXISTS eo.farm_crop (
+    site        text NOT NULL,
+    season      int  NOT NULL,
+    rpg_year    int  NOT NULL,
+    parcel_id   text NOT NULL,
+    code_group  text,
+    code_cultu  text,
+    PRIMARY KEY (site, season, rpg_year, parcel_id)
 );
 CREATE INDEX IF NOT EXISTS parcel_info_areas_idx ON eo.parcel_info USING gin (areas);
 

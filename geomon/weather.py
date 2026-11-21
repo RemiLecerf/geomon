@@ -44,6 +44,7 @@ class Product:
     step: str                  # "hour" or "day"
     resolution: str
     forecast: bool = False
+    kind: str = "grid"         # "grid" (cells weighted over an area) or "stations" (measured points)
 
 
 PRODUCTS: dict[str, Product] = {
@@ -66,6 +67,13 @@ PRODUCTS: dict[str, Product] = {
                 "Copernicus CDS sis-agrometeorological-indicators-timeseries", "day", "0.1° (~9 km)"),
         Product("sim2", "SAFRAN-ISBA (SIM2) reanalysis",
                 "Météo-France, Données changement climatique - SIM quotidienne", "day", "8 km"),
+        # Measured: the stations nearest to the site, each variable from the nearest station measuring it
+        Product("mf_stations", "Météo-France stations (measured)",
+                "Météo-France, Données climatologiques de base - quotidiennes", "day", "stations", kind="stations"),
+        Product("comephore", "COMEPHORE rainfall reanalysis (radar and rain gauges)",
+                "Météo-France, Réanalyses Coméphore (hourly, summed over UTC days)", "day", "1 km"),
+        Product("mf_etp", "Météo-France Penman-Monteith ETP (grid)",
+                "Météo-France, Données ETP spatialisées quotidiennes", "day", "0.125° (~12 km)"),
     )
 }
 
@@ -79,7 +87,11 @@ SERIES = {
     "era5": {"label": "ERA5 (reanalysis, 0.25°)", "history": "era5", "forecast": None},
     "agera5": {"label": "AgERA5 (Copernicus)", "history": "agera5", "forecast": None},
     "sim2": {"label": "SIM2 / SAFRAN (reanalysis)", "history": "sim2", "forecast": None},
+    "stations": {"label": "Météo-France stations (measured)", "history": "mf_stations", "forecast": None},
+    "comephore": {"label": "COMEPHORE (radar + rain gauges, 1 km)", "history": "comephore", "forecast": None},
+    "mf_etp": {"label": "Météo-France ETP (grid, 12 km)", "history": "mf_etp", "forecast": None},
 }
+STATIONS_MAX_KM = 40.0          # stations farther than this from the area are not used
 
 
 def store_path(name: str) -> Path:
@@ -97,12 +109,6 @@ def daily_name(name: str) -> str:
     return f"{name}_daily"
 
 
-@lru_cache(maxsize=16)
-def _open_cached(path: str, mtime: float, load: bool) -> xr.Dataset:
-    ds = xr.open_zarr(path, consolidated=True)
-    return ds.load() if load else ds
-
-
 def _mtime(name: str) -> float | None:
     z = store_path(name) / "zarr.json"
     return z.stat().st_mtime if z.exists() else None
@@ -112,10 +118,9 @@ def open_product(name: str) -> xr.Dataset | None:
     """A product of the current site. Hourly archives are opened lazily (a département's hourly
     store does not fit in memory: the daily values come from :func:`open_daily`); daily products
     and forecasts are loaded."""
-    mtime = _mtime(name)
-    if mtime is None:
-        return None
-    return _open_cached(str(store_path(name)), mtime, not _hourly_history(name))
+    from .zarrio import open_cached
+
+    return open_cached(store_path(name), load=not _hourly_history(name))
 
 
 def open_daily(name: str) -> xr.Dataset | None:
@@ -128,7 +133,9 @@ def open_daily(name: str) -> xr.Dataset | None:
     if hourly is None:
         return None
     if daily is not None and daily >= hourly:
-        return _open_cached(str(store_path(daily_name(name))), daily, True)
+        from .zarrio import open_cached
+
+        return open_cached(store_path(daily_name(name)))
     return _daily_fallback(str(store_path(name)), hourly)
 
 
@@ -140,7 +147,7 @@ def _daily_fallback(path: str, mtime: float) -> xr.Dataset:
 
 
 def clear_cache() -> None:
-    for f in (_open_cached, _daily_fallback, _series_point, _series_area, _area_weights):
+    for f in (_daily_fallback, _series_point, _series_area, _area_weights):
         f.cache_clear()
 
 
@@ -384,8 +391,34 @@ def series_daily(series: str, lon: float, lat: float, variables: list[str]) -> d
     name = base_product(series)
     if name is None:
         return {"available": False}
+    if PRODUCTS[name].kind == "stations":
+        return _stations_series(series, name, lon, lat, list(variables))
     i, dist = nearest_point(open_product(name), lon, lat)
     return _point_series(series, name, i, dist, list(variables))
+
+
+def _stations_series(series: str, name: str, lon: float, lat: float, variables: list[str]) -> dict:
+    """Measured daily values near (lon, lat): each variable, each day, from the nearest station that
+    measured it (within STATIONS_MAX_KM): the nearest station often lacks humidity or radiation."""
+    ds = open_product(name)
+    d = distance_km(lon, lat, ds["lon"].values, ds["lat"].values)
+    order = [int(i) for i in np.argsort(d) if d[i] <= STATIONS_MAX_KM]
+    if not order:
+        return {"available": False}
+    table, used = None, {}
+    for i in order:
+        t = _point_series(series, name, i, float(d[i]), variables)["table"]
+        gained = t.notna().sum() if table is None else (t.notna() & table.reindex_like(t).isna()).sum()
+        table = t if table is None else table.combine_first(t)
+        if gained.sum() > 0:
+            used[str(ds["station"].values[i])] = {"name": str(ds["station_name"].values[i]), "distance_km": round(float(d[i]), 1),
+                                                    "variables": [v for v in table.columns if gained.get(v, 0) > 0]}
+    first = order[0]
+    return {"available": True, "table": table.reindex(columns=[v for v in variables if v in table.columns]),
+            "point": {"lon": float(ds["lon"][first]), "lat": float(ds["lat"][first]),
+                      "elevation": float(ds["elevation"][first]) if "elevation" in ds else None,
+                      "distance_km": round(float(d[first]), 1)},
+            "stations": used, "forecast_from": None, "updated": ds.attrs.get("updated")}
 
 
 def _point_series(series: str, name: str, i: int, dist: float, variables: list[str]) -> dict:
@@ -455,7 +488,8 @@ def _transformers():
 
 def cell_step(name: str) -> float | None:
     """Cell size in degrees of the lat/lon products (None for SIM2, on its own grid)."""
-    fixed = {"om_era5land": 0.1, "era5land": 0.1, "era5": 0.25, "agera5": 0.1, "sim2": None}
+    fixed = {"om_era5land": 0.1, "era5land": 0.1, "era5": 0.25, "agera5": 0.1, "sim2": None, "mf_etp": 0.125,
+             "comephore": None, "mf_stations": None}
     if name in fixed:
         return fixed[name]
     # Météo-France products: the step the site's points were requested on (coarser for a large site)
@@ -472,19 +506,26 @@ def cell_polygons(name: str) -> list:
     if ds is None:
         return []
     l2e_to_wgs, _ = _transformers()
-    out = []
-    for i in range(ds.sizes["point"]):
-        if name == "sim2":
-            x, y, h = float(ds["x_l2e"][i]), float(ds["y_l2e"][i]), 4000.0
-            ring = [l2e_to_wgs(a, b) for a, b in ((x - h, y - h), (x + h, y - h), (x + h, y + h), (x - h, y + h))]
-        else:
-            # Open-Meteo cells are centred on the requested grid point; AgERA5 on its own centres
-            cx = "req_lon" if "req_lon" in ds.coords else "lon"
-            cy = "req_lat" if "req_lat" in ds.coords else "lat"
-            lon, lat, h = float(ds[cx][i]), float(ds[cy][i]), cell_step(name) / 2
-            ring = [(lon - h, lat - h), (lon + h, lat - h), (lon + h, lat + h), (lon - h, lat + h)]
-        out.append(Polygon(ring))
-    return out
+
+    def square(x, y, h, to=None):
+        ring = ((x - h, y - h), (x + h, y - h), (x + h, y + h), (x - h, y + h))
+        return Polygon([to(a, b) for a, b in ring] if to else ring)
+
+    if "x_proj" in ds.coords:              # a projected grid (COMEPHORE): square cells in its projection
+        from pyproj import Transformer
+
+        to_wgs = Transformer.from_crs(ds.attrs["crs"], "EPSG:4326", always_xy=True).transform
+        h = float(ds.attrs.get("cell_m", 1000.0)) / 2
+        return [square(x, y, h, to_wgs) for x, y in zip(ds["x_proj"].values, ds["y_proj"].values)]
+    if PRODUCTS[name].kind == "stations":  # a station: a small square around it (map display only)
+        return [square(x, y, 0.005) for x, y in zip(ds["lon"].values, ds["lat"].values)]
+    if name == "sim2":
+        return [square(x, y, 4000.0, l2e_to_wgs) for x, y in zip(ds["x_l2e"].values, ds["y_l2e"].values)]
+    # Open-Meteo cells are centred on the requested grid point; AgERA5 on its own centres
+    cx = "req_lon" if "req_lon" in ds.coords else "lon"
+    cy = "req_lat" if "req_lat" in ds.coords else "lat"
+    h = cell_step(name) / 2
+    return [square(x, y, h) for x, y in zip(ds[cx].values, ds[cy].values)]
 
 
 def area_weights(name: str, geom_wgs84: dict) -> list[tuple[int, float]]:
@@ -563,6 +604,12 @@ def _series_area(series: str, geom_json: str, variables: tuple[str, ...], stamp:
     name = base_product(series)
     if name is None:
         return {"available": False}
+    if PRODUCTS[name].kind == "stations":   # measured: the nearest stations to the area, not a grid mean
+        from shapely.geometry import shape
+
+        c = shape(json.loads(geom_json)).representative_point()
+        r = _stations_series(series, name, c.x, c.y, list(variables))
+        return r | {"cells": []} if r.get("available") else r
     weights = area_weights(name, json.loads(geom_json))
     parts, info = [], None
     for i, w in weights:

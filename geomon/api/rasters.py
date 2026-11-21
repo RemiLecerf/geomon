@@ -21,7 +21,7 @@ from ..ingest.soil import USDA_CLASSES
 
 matplotlib.use("Agg")
 
-DATASETS = {"dem": "dem.zarr", "soil": "soil.zarr"}
+DATASETS = {"dem": "dem.zarr", "soil": "soil.zarr", "soil_inrae": "soil_inrae.zarr"}
 
 # Display styles: colormap, and whether the variable is categorical
 STYLES = {
@@ -44,6 +44,7 @@ STYLES = {
     "ksat": "viridis",
     "awc": "Blues",
     "awc_total": "Blues",
+    "awc_total_sd": "Purples",
 }
 
 TEXTURE_COLORS = [

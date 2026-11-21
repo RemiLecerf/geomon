@@ -5,14 +5,16 @@ Run: uvicorn geomon.api.main:app --host 0.0.0.0 --port 8000
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -20,7 +22,7 @@ from .. import __version__, units
 from ..config import _current, all_sites, settings
 from ..db import connect
 from ..migrate import migrate
-from . import rasters, sentinel2, tiles, weather
+from . import datasets, mf_live, mf_models, modis, nowcast, radar, rasters, sentinel1, sentinel2, soils, tiles, weather
 from .areas import area as _area
 from .areas import site_row as _site
 
@@ -52,6 +54,14 @@ app = FastAPI(title="Geomon", version=__version__, lifespan=_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 app.include_router(weather.router)
 app.include_router(sentinel2.router)
+app.include_router(sentinel1.router)
+app.include_router(modis.router)
+app.include_router(radar.router)
+app.include_router(nowcast.router)
+app.include_router(mf_live.router)
+app.include_router(mf_models.router)
+app.include_router(datasets.router)
+app.include_router(soils.router)
 app.include_router(tiles.router)
 
 
@@ -70,6 +80,10 @@ async def _site_of_request(request: Request, call_next):
         _current.reset(token)
     if asked in codes:
         response.set_cookie(SITE_COOKIE, asked, max_age=365 * 86400, samesite="lax")
+    # The page itself (index.html, app.js, style.css): revalidated at every load (ETag), so that an
+    # update shows at once instead of after the browser's heuristic cache delay
+    if not request.url.path.startswith("/api/") and "cache-control" not in response.headers:
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
@@ -285,10 +299,25 @@ def rpg_geojson(year: int | None = None) -> JSONResponse:
     return _feature_collection(rows)
 
 
+@app.get("/api/rpg/years")
+def rpg_years() -> dict:
+    """RPG years loaded over the site: parcels (2015-) and îlots with their majority crop (2007-2014)."""
+    with connect() as conn:
+        bbox = "(SELECT bbox FROM meta.aoi WHERE kind = 'site' AND code = %s)"
+        parcels = [r["year"] for r in conn.execute(
+            f"SELECT DISTINCT year FROM ref.rpg_parcel WHERE geom && {bbox} ORDER BY 1", (settings.site_code,)).fetchall()]
+        ilots = [r["year"] for r in conn.execute(
+            f"SELECT DISTINCT year FROM ref.rpg_ilot WHERE geom && {bbox} ORDER BY 1", (settings.site_code,)).fetchall()]
+    return {"parcels": parcels, "ilots": [y for y in ilots if y not in parcels], "latest": settings.rpg_year}
+
+
 @app.get("/api/rpg/summary")
 def rpg_summary(year: int | None = None, area: str | None = None) -> dict:
-    """Crop areas inside an area (parcels clipped to the commune or group outline)."""
+    """Crop areas inside an area (parcels clipped to the commune or group outline). Before 2015, the
+    areas of the îlots by their majority crop group (``ilots``: true)."""
     year = year or settings.rpg_year
+    if year < settings.rpg_first_year:
+        return _ilot_summary(year, area)
     with connect() as conn:
         a = _area(conn, area)
         rows = conn.execute(
@@ -310,7 +339,29 @@ def rpg_summary(year: int | None = None, area: str | None = None) -> dict:
         ).fetchall()
     total = sum(r["area_ha"] or 0 for r in rows)
     return {"year": year, "area": {"code": a["code"], "name": a["name"], "kind": a["kind"]},
-            "units": {"area": "ha"}, "total_ha": total, "groups": rows}
+            "units": {"area": "ha"}, "total_ha": total, "groups": rows, "ilots": False}
+
+
+def _ilot_summary(year: int, area: str | None) -> dict:
+    with connect() as conn:
+        a = _area(conn, area)
+        labels = {r["code_group"]: r["label"] for r in conn.execute(
+            """SELECT code_group, mode() WITHIN GROUP (ORDER BY label_group) AS label FROM ref.rpg_crop_code
+               WHERE code_group IS NOT NULL GROUP BY 1""").fetchall()}
+        rows = conn.execute(
+            """SELECT i.code_group, min(i.group_label) AS ilot_label, count(*) AS parcels,
+                      sum(ST_Area(CASE WHEN ST_CoveredBy(i.geom, a.geom) THEN i.geom
+                                       ELSE ST_Intersection(i.geom, a.geom) END::geography)) / 1e4 AS area_ha
+               FROM ref.rpg_ilot i
+               JOIN meta.aoi a ON a.kind = %s AND a.code = %s AND a.site = %s AND ST_Intersects(i.geom, a.geom)
+               WHERE i.year = %s GROUP BY 1 ORDER BY area_ha DESC""",
+            (a["kind"], a["code"], settings.site_code, year)).fetchall()
+    groups = [{"code_group": r["code_group"], "parcels": r["parcels"], "area_ha": r["area_ha"],
+               "crop_group": labels.get(r["code_group"]) or (r["ilot_label"] or r["code_group"] or "").capitalize()}
+              for r in rows]
+    return {"year": year, "area": {"code": a["code"], "name": a["name"], "kind": a["kind"]},
+            "units": {"area": "ha"}, "total_ha": sum(g["area_ha"] or 0 for g in groups), "groups": groups,
+            "ilots": True}
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +668,24 @@ def status() -> dict:
     return {"version": __version__, "aoi": settings.site_code, "unit": settings.unit or None,
             "communes": list(settings.communes),
             "ingestion": log}
+
+
+@lru_cache(maxsize=4)
+def _index_html(mtimes: tuple) -> str:
+    """index.html with versioned links to its script and style sheet (app.js?v=<hash>): after an
+    update, the browser cannot run a cached script with the new page."""
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    for name in ("app.js", "style.css"):
+        v = hashlib.sha1((WEB_DIR / name).read_bytes()).hexdigest()[:10]
+        html = html.replace(f'"{name}"', f'"{name}?v={v}"')
+    return html
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/index.html", include_in_schema=False)
+def index() -> HTMLResponse:
+    mtimes = tuple((WEB_DIR / f).stat().st_mtime for f in ("index.html", "app.js", "style.css"))
+    return HTMLResponse(_index_html(mtimes), headers={"Cache-Control": "no-cache"})
 
 
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="web")

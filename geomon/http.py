@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import email.utils
 import logging
+import os
 import re
+import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Iterable
 
 import requests
@@ -132,3 +136,53 @@ def wfs_layer_title(typename: str) -> str | None:
 def chunks(items: list, size: int) -> Iterable[list]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def datagouv_resources(dataset_id: str) -> list[dict]:
+    """The resources (files) of a data.gouv.fr dataset: [{"url", "title", ...}]."""
+    return get_json(f"https://www.data.gouv.fr/api/1/datasets/{dataset_id}/")["resources"]
+
+
+def is_fresh(path: Path, max_age_days: float) -> bool:
+    """A local copy younger than ``max_age_days``."""
+    return path.exists() and (time.time() - path.stat().st_mtime) / 86400 <= max_age_days
+
+
+def cached_download(url: str, dest: Path, max_age_days: float, server_time: bool = False,
+                    missing_ok: bool = False) -> tuple[Path | None, bool]:
+    """``url`` saved as ``dest`` (streamed, renamed into place when complete): (path, changed).
+
+    A copy younger than ``max_age_days`` is used as it is. An older one is checked with a
+    conditional request (If-Modified-Since): when the server's file has not changed, the copy is
+    kept (and dated now, unless ``server_time``). ``server_time``: the copy is dated by the
+    server's Last-Modified, so its age is the data's age (an OSM extract). ``missing_ok``: a 404
+    gives (None, False)."""
+    if is_fresh(dest, max_age_days):
+        return dest, False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    headers = {"If-Modified-Since": email.utils.formatdate(dest.stat().st_mtime, usegmt=True)} if dest.exists() else {}
+    tmp = dest.with_name(dest.name + ".part")
+    with session().get(url, stream=True, timeout=600, headers=headers) as r:
+        if r.status_code == 304:
+            if not server_time:
+                os.utime(dest, None)
+            return dest, False
+        if missing_ok and r.status_code == 404:
+            return None, False
+        r.raise_for_status()
+        log.info("Downloading %s", url)
+        total = int(r.headers.get("Content-Length", 0))
+        done, next_report = 0, 0.0
+        with open(tmp, "wb") as fh:
+            for block in r.iter_content(chunk_size=4 << 20):
+                fh.write(block)
+                done += len(block)
+                if total > 50e6 and done / total >= next_report:
+                    log.info("  %3.0f%% of %.0f MB", 100 * done / total, total / 1e6)
+                    next_report += 0.1
+        last_modified = r.headers.get("Last-Modified")
+    os.replace(tmp, dest)
+    if server_time and last_modified:
+        ts = email.utils.parsedate_to_datetime(last_modified).timestamp()
+        os.utime(dest, (ts, ts))
+    return dest, True

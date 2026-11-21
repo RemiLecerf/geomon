@@ -15,13 +15,17 @@
       <div id="aoi-title">Loading…</div>
       <label class="row" id="site-row" hidden>Site <select id="site"></select></label>
       <label class="row" id="area-row" hidden>Area <select id="area"></select></label>
+      <div id="alerts" hidden></div>
     </header>
     <nav id="tabs">
       <button data-tab="layers" class="active">Layers</button>
       <button data-tab="commune">Statistics</button>
       <button data-tab="weather">Weather</button>
-      <button data-tab="s2">Sentinel-2</button>
+      <button data-tab="s2" title="Vegetation indices: Sentinel-2 (10 m, since 2015) and MODIS (250 m, since 2000)">Vegetation</button>
+      <button data-tab="s1" title="Sentinel-1 radar backscatter (10 m, since 2023)">SAR</button>
+      <button data-tab="soil" title="Soil properties by depth (SoilGrids 2.0, 250 m)">Soils</button>
       <button data-tab="point">Point</button>
+      <button data-tab="data" title="Datasets: what is kept and what is updated">Data</button>
     </nav>
 
     <section id="tab-layers" class="tab active">
@@ -31,7 +35,33 @@
       <h2>Vector layers</h2>
       <div id="vector-layers" class="check-list"></div>
 
-      <h2>Raster layer</h2>
+      <h2>Rain radar</h2>
+      <label class="row">Source
+        <select id="rr-source"><option value="">— none —</option></select>
+      </label>
+      <div id="rr-controls" hidden>
+        <label class="row">Period
+          <select id="rr-hours">
+            <option value="1">Last hour</option>
+            <option value="3" selected>Last 3 hours</option>
+            <option value="6">Last 6 hours</option>
+            <option value="12">Last 12 hours</option>
+            <option value="24">Last 24 hours</option>
+          </select>
+        </label>
+        <label class="row" title="Météo-France AROME-PI, run every hour: rain every 15 minutes for the next 6 hours">
+          <span><input type="checkbox" id="rr-nowcast" checked> Then the next 6 hours (forecast)</span></label>
+        <div class="rr-player">
+          <button id="rr-play" title="Play / pause" aria-label="Play or pause the animation">▶</button>
+          <input id="rr-frame" type="range" min="0" max="0" value="0" aria-label="Radar image">
+          <span id="rr-time"></span>
+        </div>
+        <label class="row">Opacity <input id="rr-opacity" type="range" min="0" max="1" step="0.05" value="0.8"></label>
+        <div id="rr-legend" class="legend"></div>
+      </div>
+      <div id="rr-status" class="muted" style="font-size:11px"></div>
+
+      <h2>Terrain</h2>
       <label class="row">Dataset
         <select id="raster-var"><option value="">— none —</option></select>
       </label>
@@ -44,7 +74,49 @@
       <div id="raster-legend" class="legend"></div>
 
       <h2>RPG crop groups</h2>
+      <label class="row">Year <select id="rpg-year"></select></label>
       <div id="rpg-summary" class="legend"></div>
+    </section>
+
+    <section id="tab-soil" class="tab">
+      <div class="hint">Soil properties by depth, soil and geology maps, groundwater. Click the map for what lies at a point.</div>
+      <label class="row">Properties
+        <select id="soil-source">
+          <option value="soil_inrae">France, INRAE / Gis Sol · 90 m</option>
+          <option value="soil">World, SoilGrids 2.0 · 250 m</option>
+        </select>
+      </label>
+      <label class="row">Property <select id="soil-var"><option value="">— none —</option></select></label>
+      <label class="row" id="soil-depth-row" hidden>Depth <select id="soil-depth"></select></label>
+      <label class="row">Opacity <input id="soil-opacity" type="range" min="0" max="1" step="0.05" value="0.75"></label>
+      <div id="soil-legend" class="legend"></div>
+      <h2>Maps</h2>
+      <div id="soil-maps" class="check-list"></div>
+      <div id="soil-maps-legend" class="legend"></div>
+      <h2>Soil of the area</h2>
+      <div id="soil-area"></div>
+      <h2>At a point</h2>
+      <div id="soil-point"><p class="muted">Click the map.</p></div>
+      <h2>Groundwater</h2>
+      <label class="row">Piezometer <select id="gw-station"></select></label>
+      <label class="row">Period
+        <select id="gw-years">
+          <option value="1">Last year</option>
+          <option value="2" selected>Last 2 years</option>
+          <option value="5">Last 5 years</option>
+          <option value="0">Whole record</option>
+        </select>
+      </label>
+      <div id="gw-chart" class="chart"></div>
+      <div id="gw-info" class="muted" style="font-size:11px"></div>
+    </section>
+
+    <section id="tab-data" class="tab">
+      <div class="hint">For each dataset of this site: <b>update regularly</b> (the archive is kept and
+        updated), <b>frozen</b> (what is stored is kept, nothing more is downloaded; "Update now" still
+        fetches once, e.g. a first archive), or <b>live</b> (only the last hours are kept). Updates and
+        deletions are run by the scheduler, usually within a minute.</div>
+      <div id="data-list"></div>
     </section>
 
     <section id="tab-commune" class="tab">
@@ -70,9 +142,39 @@
         <select id="wx-view">
           <option value="sources">Sources compared over a period</option>
           <option value="normal">This year against the 1991–2020 normal</option>
+          <option value="radar">Rain radar, last hours (Météo-France)</option>
+          <option value="obs">Observed, last days (Météo-France stations)</option>
+          <option value="maps">Forecast maps, AROME 1.3 km (51 hours)</option>
+          <option value="ensemble">Probabilities of rain and frost (PE-AROME)</option>
+          <option value="sea">Waves and storm surge</option>
         </select>
       </label>
-      <label class="row">Variable <select id="wx-var"></select></label>
+      <div id="wx-obs-controls" hidden>
+        <label class="row">Station <select id="wx-ostation"></select></label>
+        <label class="row">Period
+          <select id="wx-ohours"><option value="24">Last 24 hours</option><option value="48" selected>Last 48 hours</option>
+            <option value="120">Last 5 days</option></select></label>
+      </div>
+      <div id="wx-maps-controls" hidden>
+        <label class="row">Variable <select id="wx-mvar">
+          <option value="rain">Rain (mm/h)</option>
+          <option value="t2m">Temperature at 2 m (°C)</option>
+          <option value="gust">Gusts at 10 m (km/h)</option></select></label>
+        <div class="rr-player">
+          <button id="wx-mplay" title="Play / pause" aria-label="Play or pause the forecast animation">▶</button>
+          <input id="wx-mframe" type="range" min="0" max="0" value="0" aria-label="Forecast hour">
+          <span id="wx-mtime"></span>
+        </div>
+        <label class="row">Opacity <input id="wx-mopacity" type="range" min="0" max="1" step="0.05" value="0.75"></label>
+        <div id="wx-mlegend" class="legend"></div>
+      </div>
+      <label class="row" id="wx-var-row">Variable <select id="wx-var"></select></label>
+      <div id="wx-radar-controls" hidden>
+        <label class="row">Radar <select id="wx-rsource"></select></label>
+        <label class="row">Rain over the last <select id="wx-rhours"></select></label>
+        <label class="row">Opacity <input id="wx-ropacity" type="range" min="0" max="1" step="0.05" value="0.8"></label>
+        <div id="wx-rlegend" class="legend"></div>
+      </div>
       <div id="wx-sources-controls">
         <label class="row">Period
           <select id="wx-period">
@@ -112,15 +214,21 @@
     </section>
 
     <section id="tab-s2" class="tab">
+      <label class="row">Satellite
+        <select id="s2-source">
+          <option value="s2">Sentinel-2 · 10 m · since 2015</option>
+          <option value="modis">MODIS · 250 m · since 2000</option>
+        </select>
+      </label>
       <label class="row">View
         <select id="s2-view">
           <option value="area">Whole area (all land)</option>
-          <option value="crop">Crop group (RPG parcels)</option>
+          <option value="crop">Crop group (RPG)</option>
           <option value="parcel">One parcel (click the map)</option>
         </select>
       </label>
       <div id="s2-status" class="hint"></div>
-      <label class="row">Index <select id="s2-index"></select></label>
+      <label class="row" id="s2-index-row">Index <select id="s2-index"></select></label>
       <div id="s2-area-controls">
         <label class="row">Period <select id="s2-year"></select></label>
         <label class="row">Clear area at least
@@ -140,8 +248,8 @@
         </label>
         <label class="row">Group average
           <select id="s2-weight">
-            <option value="pixels" selected>By area (interior pixels)</option>
-            <option value="parcel">One parcel, one vote</option>
+            <option value="pixels" selected id="s2-weight-area">By area (interior pixels)</option>
+            <option value="parcel" id="s2-weight-unit">One parcel, one vote</option>
           </select>
         </label>
         <div class="check-list" id="s2-refs">
@@ -156,10 +264,28 @@
       <div id="s2-history"></div>
       <h2>Image</h2>
       <label class="row">Date <select id="s2-date"></select></label>
-      <label class="check-list"><label><input type="checkbox" id="s2-mask" checked> Hide clouds, shadows and snow (SCL)</label></label>
+      <label class="check-list"><label><input type="checkbox" id="s2-mask" checked> <span id="s2-mask-label">Hide clouds, shadows and snow (SCL)</span></label></label>
       <label class="row">Opacity <input id="s2-opacity" type="range" min="0" max="1" step="0.05" value="0.85"></label>
       <div id="s2-legend" class="legend"></div>
       <div id="s2-sources" class="muted" style="font-size:11px"></div>
+    </section>
+
+    <section id="tab-s1" class="tab">
+      <div id="s1-status" class="hint"></div>
+      <label class="row">Orbits
+        <select id="s1-dir">
+          <option value="asc">Ascending (evening passes)</option>
+          <option value="desc">Descending (morning passes)</option>
+        </select>
+      </label>
+      <label class="row">Measure <select id="s1-measure"></select></label>
+      <label class="row">Period <select id="s1-year"></select></label>
+      <div id="s1-chart" class="chart"></div>
+      <h2>Image</h2>
+      <label class="row">Date <select id="s1-date"></select></label>
+      <label class="row">Opacity <input id="s1-opacity" type="range" min="0" max="1" step="0.05" value="0.85"></label>
+      <div id="s1-legend" class="legend"></div>
+      <div id="s1-sources" class="muted" style="font-size:11px"></div>
     </section>
 
     <section id="tab-point" class="tab">
@@ -169,7 +295,7 @@
 
     <footer>
       Sources: IGN (ADMIN EXPRESS, RPG, RGE ALTI, Plan IGN, BD ORTHO), © OpenStreetMap contributors,
-      ISRIC SoilGrids 2.0, INSEE, Météo-France (SIM2; AROME/ARPEGE via Open-Meteo), ECMWF, Copernicus ERA5, ERA5-Land and AgERA5 (C3S), Copernicus Sentinel-2 (ESA, via the Copernicus Data Space openEO), Open-Meteo (CC BY 4.0).
+      ISRIC SoilGrids 2.0, INSEE, Météo-France (SIM2; AROME/ARPEGE via Open-Meteo), ECMWF, Copernicus ERA5, ERA5-Land and AgERA5 (C3S), Copernicus Sentinel-1 and Sentinel-2 (ESA, via the Copernicus Data Space openEO), NASA MODIS MOD13Q1/MYD13Q1 (LP DAAC, via the Microsoft Planetary Computer), Open-Meteo (CC BY 4.0).
     </footer>
   </aside>
   <main id="map"></main>

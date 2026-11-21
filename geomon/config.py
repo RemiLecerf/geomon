@@ -29,8 +29,10 @@ from typing import Iterator
 
 
 def _env(name: str, default: str) -> str:
-    value = os.environ.get(name)
-    return value if value not in (None, "") else default
+    """A setting from the environment; surrounding spaces and quotes (a .env pasted with quotes) are
+    dropped."""
+    value = (os.environ.get(name) or "").strip().strip("'\"").strip()
+    return value or default
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,9 @@ class Settings:
     rpg_year: int = field(default_factory=lambda: int(_env("GEOMON_RPG_YEAR", "2025")))
     # Earlier RPG years are loaded too (layers RPG.<year>), for the crop history of each parcel
     rpg_first_year: int = field(default_factory=lambda: int(_env("GEOMON_RPG_FIRST_YEAR", "2015")))
+    # RPG 1.0 îlots (majority crop group), from this year to 2014: 2010-2014 from the WFS, 2007-2009
+    # from the regional archives (100 to 300 MB each). 0: none.
+    rpg_ilot_first_year: int = field(default_factory=lambda: int(_env("GEOMON_RPG_ILOT_FIRST_YEAR", "2007")))
 
     # Raster resolutions (metres, Lambert-93)
     dem_res_m: float = field(default_factory=lambda: float(_env("GEOMON_DEM_RES_M", "5")))
@@ -129,15 +134,34 @@ class Settings:
     agera5_start: dt.date = field(
         default_factory=lambda: dt.date.fromisoformat(_env("GEOMON_AGERA5_START", "1979-01-01"))
     )
+    # Météo-France public APIs (portail-api.meteofrance.fr, free account): see geomon.meteofrance.
+    # The application ID (base64 consumer_key:consumer_secret, OAuth2) is preferred to the API key
+    meteofrance_api_key: str = field(default_factory=lambda: _env("GEOMON_METEOFRANCE_API_KEY", ""))
+    meteofrance_application_id: str = field(default_factory=lambda: _env("GEOMON_METEOFRANCE_APPLICATION_ID", ""))
+    # COMEPHORE (Météo-France rainfall reanalysis): months kept from this date; minutes of archive
+    # streaming per run (the record is filled over several runs)
+    comephore_start: dt.date = field(default_factory=lambda: dt.date.fromisoformat(_env("GEOMON_COMEPHORE_START", "1997-01-01")))
+    comephore_budget_min: float = field(default_factory=lambda: float(_env("GEOMON_COMEPHORE_BUDGET_MIN", "20")))
+    # EUMETNET OPERA radar composites: 24-hour rolling caches (S3, anonymous), tried in order; the one
+    # holding the most recent image is used (the second is the documented backup)
+    opera_buckets: tuple[str, ...] = field(default_factory=lambda: tuple(u.strip().rstrip("/") for u in _env(
+        "GEOMON_OPERA_BUCKETS", "https://s3.waw3-1.cloudferro.com/openradar-24h,"
+        "https://object-store.os-api.cci1.ecmwf.int/openradar-24h-backup").split(",") if u.strip()))
     cds_api_url: str = field(default_factory=lambda: _env("GEOMON_CDS_API_URL", "https://cds.climate.copernicus.eu/api"))
     # Sentinel-2 L2A through openEO (Copernicus Data Space Ecosystem)
     openeo_url: str = field(default_factory=lambda: _env("GEOMON_OPENEO_URL", "https://openeo.dataspace.copernicus.eu"))
     s2_start: dt.date = field(default_factory=lambda: dt.date.fromisoformat(_env("GEOMON_S2_START", "2015-06-27")))
+    # Sentinel-1 GRD backscatter (same openEO login), kept from this date
+    s1_start: dt.date = field(default_factory=lambda: dt.date.fromisoformat(_env("GEOMON_S1_START", "2023-01-01")))
+    # MODIS NDVI 250 m (Planetary Computer), kept from this date (the first Terra composite by default)
+    modis_start: dt.date = field(default_factory=lambda: dt.date.fromisoformat(_env("GEOMON_MODIS_START", "2000-02-18")))
+    # MODIS crop-group curves use the 250 m cells covered at least this much by one RPG crop group
+    modis_purity: float = field(default_factory=lambda: float(_env("GEOMON_MODIS_PURITY", "0.75")))
     # Spectral bands kept besides SCL. B04 + B08 give NDVI; add B05 for NDRE, or any other band.
     s2_bands: tuple[str, ...] = field(default_factory=lambda: tuple(
         b.strip().upper() for b in _env("GEOMON_S2_BANDS", "B04,B08").split(",") if b.strip()))
     s2_max_cloud: float = field(default_factory=lambda: float(_env("GEOMON_S2_MAX_CLOUD", "80")))
-    s2_min_clear: float = field(default_factory=lambda: float(_env("GEOMON_S2_MIN_CLEAR", "0.05")))
+    s2_min_clear: float = field(default_factory=lambda: float(_env("GEOMON_S2_MIN_CLEAR", "0.2")))
     s2_parallel_jobs: int = field(default_factory=lambda: int(_env("GEOMON_S2_PARALLEL_JOBS", "2")))
     s2_years_per_job: int = field(default_factory=lambda: int(_env("GEOMON_S2_YEARS_PER_JOB", "4")))
     # Parcel time series: a parcel-date is used when at least this share of the parcel is clear
@@ -195,6 +219,10 @@ class Settings:
         return self.site.farm_name
 
     @property
+    def farm_landcover(self) -> tuple["LandCoverFile", ...]:
+        return self.site.farm_landcover
+
+    @property
     def zarr_dir(self) -> Path:
         return self.data_dir / "zarr"
 
@@ -202,6 +230,10 @@ class Settings:
     def site_zarr_dir(self) -> Path:
         """Rasters and weather stores of the current site."""
         return self.zarr_dir / "sites" / self.site_code
+
+    def site_dir(self, site: str | None = None) -> Path:
+        """The stores of a site (default: the current one)."""
+        return self.zarr_dir / "sites" / (site or self.site_code)
 
     @property
     def raw_dir(self) -> Path:
@@ -228,6 +260,8 @@ class Site:
     farm_file: str = ""
     farm_name: str = ""
     unit: str = ""                     # "DEP:50": every commune of an administrative unit
+    # The farm's land cover, one file per year (the same file may serve several years)
+    farm_landcover: tuple["LandCoverFile", ...] = ()
 
     def __post_init__(self):
         if self.unit:
@@ -237,6 +271,28 @@ class Site:
                                  f"{', '.join(UNIT_LEVELS)}, not {self.unit!r}")
         elif not self.communes:
             raise ValueError(f"Site {self.code}: give its communes or an administrative unit (unit)")
+
+
+@dataclass(frozen=True)
+class LandCoverFile:
+    """A file of the farm's land cover for a year: polygons (plots, fields) with their crop. Any vector
+    format GDAL reads (GeoJSON, shapefile, GeoPackage...), any projection (see geomon.vector)."""
+    year: int
+    path: str                          # absolute, or relative to the data directory
+    layer: str | None = None           # default: the first polygon layer
+    crs: str | None = None             # when the file does not state its projection, e.g. "EPSG:2154"
+    crop_field: str | None = None      # RPG crop code (default: CODE_CULTU, CODE_CULTURE, CULTURE...)
+    group_field: str | None = None     # RPG crop group (default: CODE_GROUP...; else from the crop code)
+
+
+def _landcover(raw: dict | None) -> tuple[LandCoverFile, ...]:
+    """sites.json ``farm_landcover``: {"2025": "farm/x/landcover_2025.gpkg", "2026": {"path": ..., "crs": ...}}."""
+    out = []
+    for year, spec in (raw or {}).items():
+        spec = {"path": spec} if isinstance(spec, str) else dict(spec)
+        out.append(LandCoverFile(int(year), spec["path"], spec.get("layer"), spec.get("crs"),
+                                 spec.get("crop_field"), spec.get("group_field")))
+    return tuple(sorted(out, key=lambda f: f.year))
 
 
 _SITES_CACHE: dict = {}
@@ -268,7 +324,9 @@ def all_sites() -> list[Site]:
         sites = [Site(code=s["code"], name=s.get("name") or ("" if s.get("unit") else s["code"]),
                       communes=tuple(str(c) for c in s.get("communes", ())),
                       farm_file=s.get("farm_file", ""), farm_name=s.get("farm_name", ""),
-                      unit=str(s.get("unit", "")).upper()) for s in raw]
+                      unit=str(s.get("unit", "")).upper(),
+                      farm_landcover=_landcover(s.get("farm_landcover")))
+                 for s in raw]
         if not sites:
             raise ValueError(f"{p}: no site")
         if len({s.code for s in sites}) != len(sites):

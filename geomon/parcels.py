@@ -33,6 +33,18 @@ of its own RPG year. The RPG of the current year is published a year later:
 until then the latest RPG outlines are used, and its crops only for permanent
 crops (permanent grassland, orchards, vines...); other crops of the season are
 unknown.
+
+The farm's own land cover (one file per year, the site's ``farm_landcover``, ref.farm_landcover) is
+used for its plots: in a season with a land-cover file, the RPG parcels whose point on surface lies in
+one of the farm's plots take the farm's crop (status ``farm``, eo.farm_crop), instead of the RPG's
+declaration or of an unknown crop (RPG not published yet).
+
+Better still, the farm's fields have their own series: their outlines (shrunk by 10 m, as the RPG
+parcels) are the parcels of a layer of their own, ``rpg_year`` 0 (FARM_LAYER) in eo.parcel_stats,
+parcel_season and parcel_info, with ids 'F' + a hash of the outline. In a season with a land-cover
+file, its fields replace the RPG parcels lying in them (eo.farm_crop: the fields with their crop, and
+the replaced RPG parcels without one), in every area: the communes and the group as the farm's own
+("My plots"), which only has curves for those seasons, from its fields.
 """
 
 from __future__ import annotations
@@ -67,6 +79,7 @@ LAMBDA = 100                 # Whittaker smoothing (daily grid, 2nd differences)
 PERMANENT_GROUPS = {"17", "18", "20", "21", "22", "23"}
 # Peak of the season's crop: 1 January to 31 August (later, the next crop may have been sown)
 PEAK_DAYS = (JAN1, JAN1 + 243)
+FARM_LAYER = 0               # rpg_year of the farm's own fields (ref.farm_landcover.field_id)
 # Tables: eo.parcel_stats, eo.parcel_dates, eo.parcel_season (geomon/schema.sql)
 
 
@@ -133,14 +146,21 @@ def _labels(site: str, rpg_year: int, ds: xr.Dataset) -> tuple[np.ndarray, list[
         return _LABELS[key]
     epsg = CRS.from_user_input(ds.attrs["crs"]).to_epsg()
     with connect() as conn:
-        rows = conn.execute(
+        if rpg_year == FARM_LAYER:          # the farm's fields, every year's (one series per outline)
+            rows = conn.execute(
+                """SELECT DISTINCT ON (field_id) field_id AS parcel_id,
+                          ST_AsBinary(ST_Buffer(ST_Transform(geom, %s), %s)) AS g
+                   FROM ref.farm_landcover WHERE site = %s AND field_id IS NOT NULL ORDER BY field_id""",
+                (epsg, -EDGE_BUFFER_M, site)).fetchall()
+        else:
+            rows = conn.execute(
             """SELECT DISTINCT ON (p.parcel_id) p.parcel_id,
                       ST_AsBinary(ST_Buffer(ST_Transform(p.geom, %s), %s)) AS g
                FROM ref.rpg_parcel p
                JOIN meta.aoi a ON a.kind = 'site' AND a.code = %s AND ST_Intersects(ST_PointOnSurface(p.geom), a.geom)
                WHERE p.year = %s ORDER BY p.parcel_id, p.surf_ha DESC NULLS LAST""",
             (epsg, -EDGE_BUFFER_M, site, rpg_year),
-        ).fetchall()
+            ).fetchall()
     ids, shapes = [], []
     for r in rows:
         g = wkb.loads(bytes(r["g"]))
@@ -192,12 +212,13 @@ def _date_rows(site: str, one: xr.Dataset, d: dt.date, todo: dict[int, list[str]
 def _write_stats(site: str, rows: list[tuple], done: list[tuple]) -> None:
     with connect() as conn:
         with conn.cursor() as cur:
-            cur.executemany("DELETE FROM eo.parcel_stats WHERE site = %s AND rpg_year = %s AND index = %s AND date = %s",
-                            [(site, gy, ix, d) for gy, ix, d in done])
-            with cur.copy("COPY eo.parcel_stats (site, rpg_year, parcel_id, index, date, mean, std, n_pixels, n_clear) "
+            sid = cur.execute("SELECT meta.site_id(%s) AS id", (site,)).fetchone()["id"]
+            cur.executemany("DELETE FROM eo.parcel_stats WHERE site_id = %s AND rpg_year = %s AND index = %s AND date = %s",
+                            [(sid, gy, ix, d) for gy, ix, d in done])
+            with cur.copy("COPY eo.parcel_stats (site_id, rpg_year, parcel_id, index, date, mean, std, n_pixels, n_clear) "
                           "FROM STDIN") as cp:
                 for r in rows:
-                    cp.write_row(r)
+                    cp.write_row((sid,) + tuple(r[1:]))
             cur.executemany("INSERT INTO eo.parcel_dates (site, rpg_year, index, date) VALUES (%s, %s, %s, %s) "
                             "ON CONFLICT DO NOTHING", [(site, gy, ix, d) for gy, ix, d in done])
 
@@ -208,12 +229,15 @@ def _missing(site: str, years_rpg: list[int]) -> dict[dt.date, dict[int, list[st
         have = {(r["rpg_year"], r["index"], r["date"]) for r in conn.execute(
             "SELECT rpg_year, index, date FROM eo.parcel_dates WHERE site = %s", (site,)).fetchall()}
     out: dict[dt.date, dict[int, list[str]]] = {}
+    farm = set(farm_years(site))
     stores = [(part, y) for part in s2.parts(site) for y in s2.years(site, part)]
     for part, y in stores:
         ds = s2.open_year(site, y, part)
         indices = s2.available_indices(ds.data_vars)
         for t in ds["time"].values.astype("datetime64[D]").astype(object):
             gys = {geometry_year(s, years_rpg) for s in seasons_of(t, PAD)} - {None}
+            if farm & set(seasons_of(t, PAD)):
+                gys.add(FARM_LAYER)
             for gy in gys:
                 todo = [ix for ix in indices if (gy, ix, t) not in have]
                 if todo:
@@ -231,6 +255,7 @@ def store_missing_stats(site: str) -> set[int]:
     missing = _missing(site, years_rpg)
     if not missing:
         return set()
+    farm = set(farm_years(site))
     log.info("Parcels: statistics of %d dates to compute", len(missing))
     touched: set[int] = set()
     by_year: dict[int, list[dt.date]] = {}
@@ -248,7 +273,8 @@ def store_missing_stats(site: str) -> set[int]:
                 if hit.size:
                     rows += _date_rows(site, ds.isel(time=int(hit[0])).load(), d, missing[d])
             done += [(gy, ix, d) for gy, ixs in missing[d].items() for ix in ixs]
-            touched |= {s for s in seasons_of(d, PAD) if geometry_year(s, years_rpg) in missing[d]}
+            touched |= {s for s in seasons_of(d, PAD) if geometry_year(s, years_rpg) in missing[d]
+                        or (FARM_LAYER in missing[d] and s in farm)}
         _write_stats(site, rows, done)
         n_rows += len(rows)
         log.info("Parcels %d: %d dates, %d parcel-dates", y, len(dates), len(rows))
@@ -348,18 +374,21 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
         gy = geometry_year(season, years_rpg)
         if gy is None:
             continue
+        fields = season_fields(site, season)
         with connect() as conn:
             obs = pd.DataFrame(conn.execute(
-                """SELECT index, parcel_id, date, mean, n_pixels FROM eo.parcel_stats
-                   WHERE site = %s AND rpg_year = %s AND date BETWEEN %s AND %s AND n_clear >= %s * n_pixels
-                   ORDER BY index, parcel_id, date""",
-                (site, gy, season_start(season) - dt.timedelta(PAD), season_end(season) + dt.timedelta(PAD),
-                 settings.s2_parcel_min_clear),
+                """SELECT index, rpg_year, parcel_id, date, mean, n_pixels FROM eo.parcel_stats
+                   WHERE site_id = meta.site_key_of(%(site)s) AND (rpg_year = %(gy)s OR (rpg_year = %(farm)s AND parcel_id = ANY(%(fields)s)))
+                     AND date BETWEEN %(d0)s AND %(d1)s AND n_clear >= %(min_clear)s * n_pixels
+                   ORDER BY index, rpg_year, parcel_id, date""",
+                {"site": site, "gy": gy, "farm": FARM_LAYER, "fields": fields,
+                 "d0": season_start(season) - dt.timedelta(PAD), "d1": season_end(season) + dt.timedelta(PAD),
+                 "min_clear": settings.s2_parcel_min_clear},
             ).fetchall())
         rows = []
         if len(obs):
             obs["t"] = [(d - season_start(season)).days + PAD for d in obs["date"]]
-            for (ix, pid), g in obs.groupby(["index", "parcel_id"], sort=False):
+            for (ix, ry, pid), g in obs.groupby(["index", "rpg_year", "parcel_id"], sort=False):
                 t, y = g["t"].to_numpy(), g["mean"].to_numpy(dtype="float64")
                 inside = t[(t >= PAD) & (t < PAD + SEASON_DAYS)] - PAD
                 if len(inside) < MIN_OBS:
@@ -373,7 +402,7 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
                     continue
                 main = z[PEAK_DAYS[0]:PEAK_DAYS[1]]
                 k = PEAK_DAYS[0] + int(np.nanargmax(main)) if np.isfinite(main).any() else None  # none yet
-                rows.append((site, season, ix, pid, gy, len(inside), season_start(season) + dt.timedelta(int(inside[0])),
+                rows.append((site, season, ix, pid, int(ry), len(inside), season_start(season) + dt.timedelta(int(inside[0])),
                              season_start(season) + dt.timedelta(int(inside[-1])), None if k is None else float(z[k]),
                              None if k is None else season_start(season) + dt.timedelta(k),
                              z.astype("<f4").tobytes(), int(g["n_pixels"].max())))
@@ -389,6 +418,15 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
     return n
 
 
+def clear_site(conn, site: str, rpg_year: int | None = None) -> None:
+    """A site's parcel rows (statistics, dates processed, curves, parcel info), of one RPG layer or all."""
+    layer = "" if rpg_year is None else " AND rpg_year = %s"
+    args = (site,) if rpg_year is None else (site, rpg_year)
+    conn.execute(f"DELETE FROM eo.parcel_stats WHERE site_id = meta.site_key_of(%s){layer}", args)
+    for t in ("parcel_dates", "parcel_season", "parcel_info"):
+        conn.execute(f"DELETE FROM eo.{t} WHERE site = %s{layer}", args)
+
+
 def sync(site: str, full: bool = False) -> dict:
     """Parcel statistics of new dates (or of every date when ``full``), then the curves of the seasons touched.
 
@@ -396,8 +434,8 @@ def sync(site: str, full: bool = False) -> dict:
     """
     if full:
         with connect() as conn:
-            for t in ("parcel_stats", "parcel_dates", "parcel_season", "parcel_info", "group_season"):
-                conn.execute(f"DELETE FROM eo.{t} WHERE site = %s", (site,))
+            clear_site(conn, site)
+            conn.execute("DELETE FROM eo.group_season WHERE site = %s AND index = ANY(%s)", (site, list(s2.INDICES)))
     clear_labels()
     try:
         touched = store_missing_stats(site)
@@ -407,7 +445,7 @@ def sync(site: str, full: bool = False) -> dict:
     with connect() as conn:
         stale = {r["season"] for r in conn.execute(
             "SELECT DISTINCT season, rpg_year FROM eo.parcel_season WHERE site = %s", (site,)).fetchall()
-            if geometry_year(r["season"], years_rpg) != r["rpg_year"]}
+            if r["rpg_year"] != FARM_LAYER and geometry_year(r["season"], years_rpg) != r["rpg_year"]}
         if stale:
             conn.execute("DELETE FROM eo.parcel_season WHERE site = %s AND season = ANY(%s)", (site, list(stale)))
     seasons = None if full else touched | stale
@@ -415,7 +453,8 @@ def sync(site: str, full: bool = False) -> dict:
     # Crop-group curves of the seasons recomputed (all of them when none was computed yet)
     with connect() as conn:
         backfill = (conn.execute("SELECT 1 FROM eo.parcel_season WHERE site = %s LIMIT 1", (site,)).fetchone()
-                    and not conn.execute("SELECT 1 FROM eo.group_season WHERE site = %s LIMIT 1", (site,)).fetchone())
+                    and not conn.execute("SELECT 1 FROM eo.group_season WHERE site = %s AND index = ANY(%s) LIMIT 1",
+                                         (site, list(s2.INDICES))).fetchone())
     groups = compute_groups(site, None if (full or backfill) else seasons) if (full or seasons or backfill) else 0
     return {"seasons": sorted(seasons) if seasons is not None else "all", "curves": n, "group_curves": groups}
 
@@ -424,10 +463,104 @@ def sync(site: str, full: bool = False) -> dict:
 # 3. Crop-group curves per area, computed at ingestion (eo.parcel_info, eo.group_season)
 # ---------------------------------------------------------------------------
 def crop_status(season: int, rpg_year: int, code_group: str | None) -> str:
-    """declared (the season's own RPG), assumed (a permanent crop taken from the latest RPG) or unknown."""
+    """declared (the season's own RPG), assumed (a permanent crop taken from the latest RPG) or unknown
+    (a parcel of the farm's plots may be ``farm`` instead, see :func:`effective_crop`)."""
     if season == rpg_year:
         return "declared"
     return "assumed" if code_group in PERMANENT_GROUPS else "unknown"
+
+
+def farm_years(site: str) -> list[int]:
+    """The years of the farm's land cover (ref.farm_landcover)."""
+    with connect() as conn:
+        return [r["year"] for r in conn.execute(
+            "SELECT DISTINCT year FROM ref.farm_landcover WHERE site = %s ORDER BY 1", (site,)).fetchall()]
+
+
+def effective_crop(season: int, rpg_year: int, code_group: str | None, code_cultu: str | None,
+                   farm: tuple[str | None, str | None] | None = None) -> tuple[str | None, str | None, str]:
+    """(group, crop, status) of a parcel in a season: the farm's crop when its land cover gives one
+    for the parcel's place (``farm``: (group, crop); status ``farm``), else the RPG's (see
+    :func:`crop_status`)."""
+    if farm is not None and farm[0]:
+        return farm[0], farm[1], "farm"
+    return code_group, code_cultu, crop_status(season, rpg_year, code_group)
+
+
+def season_fields(site: str, season: int) -> list[str]:
+    """The ids of the farm's fields declared for a season (its land-cover year)."""
+    with connect() as conn:
+        return [r["field_id"] for r in conn.execute(
+            "SELECT DISTINCT field_id FROM ref.farm_landcover WHERE site = %s AND year = %s AND field_id IS NOT NULL",
+            (site, season)).fetchall()]
+
+
+def refresh_field_info(site: str) -> int:
+    """eo.parcel_info of the farm's fields (rpg_year FARM_LAYER): area and the site's areas holding them
+    (their point on surface); their crop is per season, in eo.farm_crop."""
+    with connect() as conn:
+        conn.execute("DELETE FROM eo.parcel_info WHERE site = %s AND rpg_year = %s", (site, FARM_LAYER))
+        return conn.execute(
+            """INSERT INTO eo.parcel_info (site, rpg_year, parcel_id, code_group, code_cultu, surf_ha, bio, areas)
+               SELECT %(site)s, %(farm)s, f.field_id, NULL, NULL, ST_Area(f.geom::geography) / 1e4, NULL,
+                      array_agg(a.code ORDER BY a.code)
+               FROM (SELECT DISTINCT ON (field_id) field_id, geom FROM ref.farm_landcover
+                     WHERE site = %(site)s AND field_id IS NOT NULL ORDER BY field_id) f
+               JOIN meta.aoi a ON a.site = %(site)s AND ST_Intersects(a.geom, ST_PointOnSurface(f.geom))
+               GROUP BY f.field_id, f.geom""", {"site": site, "farm": FARM_LAYER}).rowcount or 0
+
+
+def refresh_farm_crops(site: str, seasons) -> int:
+    """eo.farm_crop for the given seasons with a land-cover file: its fields (rpg_year FARM_LAYER) with
+    their crop, and the RPG parcels of the season (its RPG year's outlines) lying in them (point on
+    surface), without crop: replaced by the fields."""
+    years_rpg = rpg_years()
+    have = set(farm_years(site))
+    n = 0
+    with connect() as conn:
+        for season in sorted(seasons):
+            conn.execute("DELETE FROM eo.farm_crop WHERE site = %s AND season = %s", (site, season))
+            gy = geometry_year(season, years_rpg)
+            if season not in have:
+                continue
+            n += conn.execute(
+                """INSERT INTO eo.farm_crop (site, season, rpg_year, parcel_id, code_group, code_cultu)
+                   SELECT DISTINCT ON (field_id) %(site)s, %(season)s, %(farm)s, field_id, code_group, code_cultu
+                   FROM ref.farm_landcover WHERE site = %(site)s AND year = %(season)s AND field_id IS NOT NULL
+                   ORDER BY field_id, code_group NULLS LAST""",
+                {"site": site, "season": season, "farm": FARM_LAYER}).rowcount or 0
+            if gy is None:
+                continue
+            conn.execute(
+                """INSERT INTO eo.farm_crop (site, season, rpg_year, parcel_id, code_group, code_cultu)
+                   SELECT DISTINCT ON (i.parcel_id) %(site)s, %(season)s, i.rpg_year, i.parcel_id, NULL, NULL
+                   FROM eo.parcel_info i
+                   JOIN ref.rpg_parcel p ON p.year = i.rpg_year AND p.parcel_id = i.parcel_id
+                   JOIN ref.farm_landcover l ON l.site = %(site)s AND l.year = %(season)s
+                        AND ST_Intersects(l.geom, ST_PointOnSurface(p.geom))
+                   WHERE i.site = %(site)s AND i.rpg_year = %(gy)s
+                   ORDER BY i.parcel_id
+                   ON CONFLICT DO NOTHING""",
+                {"site": site, "season": season, "gy": gy})
+    return n
+
+
+def in_season(farm: dict, rpg_year: int, parcel_id: str) -> bool:
+    """Whether a parcel series counts in a season: the farm's fields declared for it (with a crop)
+    replace the RPG parcels lying in them (``farm``: see :func:`farm_crops`)."""
+    f = farm.get((rpg_year, parcel_id))
+    if rpg_year == FARM_LAYER:
+        return f is not None and f[0] is not None
+    return f is None
+
+
+def farm_crops(site: str, season: int) -> dict[tuple[int, str], tuple[str | None, str | None]]:
+    """(RPG year, parcel id) -> (group, crop) declared by the farm for a season: its fields
+    (FARM_LAYER) with their crop, the RPG parcels they replace with (None, None)."""
+    with connect() as conn:
+        return {(r["rpg_year"], r["parcel_id"]): (r["code_group"], r["code_cultu"]) for r in conn.execute(
+            "SELECT rpg_year, parcel_id, code_group, code_cultu FROM eo.farm_crop WHERE site = %s AND season = %s",
+            (site, season)).fetchall()}
 
 
 def refresh_parcel_info(site: str, years) -> int:
@@ -498,25 +631,35 @@ def compute_groups(site: str, seasons=None) -> int:
                 "SELECT DISTINCT season FROM eo.parcel_season WHERE site = %s", (site,)).fetchall()}
     seasons = sorted(seasons)
     refresh_parcel_info(site, {geometry_year(s, years_rpg) for s in seasons} - {None})
+    refresh_field_info(site)
+    refresh_farm_crops(site, seasons)
+    declared_years = set(farm_years(site))     # with land-cover files, the farm area only from them
     n = 0
     for season in seasons:
+        farm = farm_crops(site, season)
         with connect() as conn:
             rows = conn.execute(
-                """SELECT c.index, c.rpg_year, c.n_pixels, c.curve, i.code_group, i.surf_ha, i.areas
+                """SELECT c.index, c.rpg_year, c.parcel_id, c.n_pixels, c.curve, i.code_group, i.code_cultu,
+                          i.surf_ha, i.areas
                    FROM eo.parcel_season c
                    JOIN eo.parcel_info i ON i.site = c.site AND i.rpg_year = c.rpg_year AND i.parcel_id = c.parcel_id
                    WHERE c.site = %s AND c.season = %s ORDER BY c.index, c.parcel_id""", (site, season)).fetchall()
+        rows = [r for r in rows if in_season(farm, r["rpg_year"], r["parcel_id"])]
         out = []
         for ix in sorted({r["index"] for r in rows}):
             rs = [r for r in rows if r["index"] == ix]
             mat = np.stack([np.frombuffer(r["curve"], dtype="<f4") for r in rs]).astype("float64")
-            status = np.array([crop_status(season, r["rpg_year"], r["code_group"]) for r in rs])
-            group = np.array([r["code_group"] or "" for r in rs])
+            eff = [effective_crop(season, r["rpg_year"], r["code_group"], r["code_cultu"],
+                                  farm.get((r["rpg_year"], r["parcel_id"]))) for r in rs]
+            status = np.array([e[2] for e in eff])
+            group = np.array([e[0] or "" for e in eff])
             ha = np.array([r["surf_ha"] or 0.0 for r in rs])
             w = np.array([r["n_pixels"] or 1 for r in rs], dtype="float64")
             members: dict[str, list[int]] = {}
             for k, r in enumerate(rs):
                 for code in r["areas"]:
+                    if code == "farm" and declared_years and (r["rpg_year"], r["parcel_id"]) not in farm:
+                        continue            # the farm's plots: only what the farm declared for the season
                     members.setdefault(code, []).append(k)
             for area, idx in members.items():
                 idx = np.asarray(idx)
@@ -528,11 +671,13 @@ def compute_groups(site: str, seasons=None) -> int:
                 for g in sorted(set(group[known]) - {""}):
                     sel = known[group[known] == g]
                     weighted, plain, q25, q75, cnt = _group_curve(mat[sel], w[sel])
-                    st = "declared" if (status[sel] == "declared").all() else "assumed"
+                    st = ("declared" if (status[sel] == "declared").all()
+                          else "farm" if np.isin(status[sel], ("declared", "farm")).all() else "assumed")
                     out.append((site, ix, area, g, season, int(sel.size), float(ha[sel].sum()), st, _f32(weighted),
                                 _f32(plain), _f32(q25), _f32(q75), cnt.astype("<i2").tobytes()))
         with connect() as conn:
-            conn.execute("DELETE FROM eo.group_season WHERE site = %s AND season = %s", (site, season))
+            conn.execute("DELETE FROM eo.group_season WHERE site = %s AND season = %s AND index = ANY(%s)",
+                         (site, season, list(s2.INDICES)))
             with conn.cursor() as cur:
                 with cur.copy("COPY eo.group_season (site, index, area, code_group, season, parcels, ha, status, "
                               "mean_pixels, mean_parcel, q25, q75, count) FROM STDIN") as cp:

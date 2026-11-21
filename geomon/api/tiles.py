@@ -34,12 +34,36 @@ f AS (
 SELECT ST_AsMVT(f.*, 'rpg', {EXTENT}, 'geom') AS mvt FROM f WHERE geom IS NOT NULL
 """
 
+# RPG 1.0 (before 2015): the farms' îlots and their majority crop group, with the same attributes
+_ILOT_SQL = f"""
+WITH {_TILE},
+a AS (SELECT geom, bbox FROM meta.aoi WHERE kind = 'site' AND code = %(site)s),
+f AS (
+    SELECT i.id, i.year, i.ilot_id AS parcel_id, NULL AS code_cultu, 'Îlot (several parcels)' AS crop,
+           i.code_group, i.group_label AS crop_group, i.surf_ha, round((i.group_ha / NULLIF(i.surf_ha, 0))::numeric, 2) AS share,
+           true AS ilot, ST_Intersects(i.geom, a.geom) AS in_commune, {_GEOM.format(g="i.geom")}
+    FROM ref.rpg_ilot i CROSS JOIN t CROSS JOIN a
+    WHERE i.year = %(year)s AND i.geom && t.box AND i.geom && a.bbox)
+SELECT ST_AsMVT(f.*, 'rpg', {EXTENT}, 'geom') AS mvt FROM f WHERE geom IS NOT NULL
+"""
+
 _OSM_SQL = f"""
 WITH {_TILE},
 f AS (
     SELECT o.osm_id, o.kind, o.name, {_GEOM.format(g="o.geom")}
     FROM ref.osm_feature o CROSS JOIN t
     WHERE o.site = %(site)s AND o.layer = %(layer)s AND o.geom && t.box)
+SELECT ST_AsMVT(f.*, %(layer)s, {EXTENT}, 'geom') AS mvt FROM f WHERE geom IS NOT NULL
+"""
+
+
+SOIL_LAYERS = {"soils", "geology", "clay"}
+_SOIL_SQL = f"""
+WITH {_TILE},
+f AS (
+    SELECT s.id, s.code, s.label, s.color, {_GEOM.format(g="s.geom")}
+    FROM ref.soil_feature s CROSS JOIN t
+    WHERE s.site = %(site)s AND s.layer = %(layer)s AND s.geom && t.box)
 SELECT ST_AsMVT(f.*, %(layer)s, {EXTENT}, 'geom') AS mvt FROM f WHERE geom IS NOT NULL
 """
 
@@ -54,9 +78,12 @@ def tile(layer: str, z: int, x: int, y: int, year: int | None = None) -> bytes:
     _check(z, x, y)
     params = {"z": z, "x": x, "y": y, "site": settings.site_code}
     if layer == "rpg":
-        sql, params["year"] = _RPG_SQL, year or settings.rpg_year
+        params["year"] = year or settings.rpg_year
+        sql = _ILOT_SQL if params["year"] < settings.rpg_first_year else _RPG_SQL
     elif layer in OSM_LAYERS:
         sql, params["layer"] = _OSM_SQL, layer
+    elif layer in SOIL_LAYERS:
+        sql, params["layer"] = _SOIL_SQL, layer
     else:
         raise HTTPException(404, f"Unknown tile layer {layer}")
     with connect() as conn:

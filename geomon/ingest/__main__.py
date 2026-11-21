@@ -14,11 +14,13 @@ import logging
 import sys
 import traceback
 
+from .. import datasets
 from ..aoi import resolve_aoi, save_aoi
 from ..config import all_sites, settings, use_site
 from ..db import connect
 from .lock import ingest_lock, lock_group
-from . import admin, agera5, dem, era5, farm, insee, openmeteo, osm, rpg, sentinel2, sim2, soil
+from . import (admin, agera5, alerts, comephore, dem, era5, farm, groundwater, insee, mf_etp, mf_models, mf_obs, mf_stations, modis, nowcast, openmeteo,
+               osm, radar, rpg, sentinel1, sentinel2, sim2, soil, soil_inrae, soil_maps)
 
 STEPS = {
     "admin": admin.run,
@@ -27,22 +29,46 @@ STEPS = {
     "osm": osm.run,
     "dem": dem.run,
     "soil": soil.run,
+    "soil-inrae": soil_inrae.run,       # INRAE / Gis Sol soil properties and water reserve, 90 m (France)
+    "soil-maps": soil_maps.run,         # dominant soils (Gis Sol RRP), geology 1:50 000 and clay exposure (BRGM)
+    "groundwater": groundwater.run,     # groundwater levels of the nearest piezometers (Hub'Eau)
     "insee": insee.run,
     "weather": openmeteo.run_history,   # Open-Meteo: Météo-France archived forecasts (+ ERA5-Land if GEOMON_ERA5_SOURCE=openmeteo)
     "era5land": era5.run_land,          # Copernicus CDS ERA5-Land hourly, 0.1° (needs GEOMON_CDS_API_KEY)
     "era5": era5.run_era5,              # Copernicus CDS ERA5 hourly, 0.25° (needs GEOMON_CDS_API_KEY)
     "sim2": sim2.run,                   # Météo-France SAFRAN-ISBA daily reanalysis
+    "mf-stations": mf_stations.run,     # measured daily weather of the nearest Météo-France stations (no account)
+    "mf-etp": mf_etp.run,               # Météo-France daily Penman-Monteith ETP, 0.125° grid (no account)
+    "comephore": comephore.run,         # COMEPHORE hourly rainfall reanalysis, 1 km, since 1997 (no account; long)
     "agera5": agera5.run,               # Copernicus AgERA5 (needs GEOMON_CDS_API_KEY)
     "sentinel2": sentinel2.run,         # Sentinel-2 L2A via openEO (needs sentinel2-login once)
     "sentinel2-login": sentinel2.login, # interactive: log in to the Copernicus Data Space
     "sentinel2-stats": sentinel2.recompute,  # recompute index statistics from the stored images
     "sentinel2-parcels": sentinel2.recompute_parcels,  # recompute the RPG parcel series (after an RPG reload)
+    "sentinel2-groups": sentinel2.recompute_groups,  # recompute the crop-group curves only (after an RPG change)
+    "sentinel2-reencode": sentinel2.reencode,  # rewrite the stored images (encoding, dates below GEOMON_S2_MIN_CLEAR)
+    "sentinel1": sentinel1.run,         # Sentinel-1 GRD backscatter via openEO (same login), from GEOMON_S1_START
+    "sentinel1-stats": sentinel1.recompute,  # recompute the Sentinel-1 statistics from the stored images
+    "sentinel1-reencode": sentinel1.reencode,  # rewrite the stored images with the current encoding
+    "modis": modis.run,                 # MODIS NDVI 250 m (Planetary Computer, no account), from GEOMON_MODIS_START
+    "modis-stats": modis.recompute,     # recompute the MODIS statistics from the stored composites
+    "modis-crops": modis.recompute_crops,  # recompute the MODIS crop-group curves (after an RPG reload)
+    "radar": radar.run_opera,           # rain radar, EUMETNET OPERA composites (no account), the kept hours
+    "radar-mf": radar.run_mf,           # rain radar, Météo-France latest 5-minute image (key)
+    "arome-pi": nowcast.run,            # nowcast, the next 6 hours: Météo-France AROME-PI (key)
+    "mf-obs": mf_obs.run,               # observations of the last days, nearest Météo-France stations (key)
+    "vigilance": alerts.run_vigilance,  # Météo-France Vigilance of the site's départements (key)
+    "meteo-forets": alerts.run_forets,  # Météo des forêts, fire danger (key; fire season only)
+    "arome": mf_models.run_arome,       # AROME 1.3 km maps, 51 hours (key)
+    "pe-arome": mf_models.run_pearome,  # PE-AROME ensemble probabilities of rain and frost (key)
+    "sea": mf_models.run_sea,           # waves (MFWAM) and storm surge (HYCOM2D), coastal sites (key)
     "forecast": openmeteo.run_forecast, # latest forecast (run it daily)
 }
 
 
 # Interactive steps, never part of "all"
-MANUAL_STEPS = {"sentinel2-login", "sentinel2-stats", "sentinel2-parcels"}
+MANUAL_STEPS = {"sentinel2-login", "sentinel2-stats", "sentinel2-parcels", "sentinel2-groups", "sentinel1-stats", "modis-stats", "modis-crops",
+                "sentinel2-reencode", "sentinel1-reencode"}
 
 
 def _log_step(step: str, started: dt.datetime, status: str, message: str, details: dict) -> None:
@@ -70,8 +96,13 @@ def run_step(step: str, aoi) -> bool | Failure:
     started = dt.datetime.now(dt.timezone.utc)
     log.info("=== %s · %s ===", settings.site_code, step)
     try:
-        with ingest_lock(lock_group(step)):
-            details = STEPS[step](aoi) or {}
+        d = datasets.of_step(step)
+        need = datasets.needs(d.code) if d else None
+        if need:
+            details = {"skipped": f"needs {need}"}
+        else:
+            with ingest_lock(lock_group(step)):
+                details = STEPS[step](aoi) or {}
         _log_step(step, started, "ok", "", details)
         log.info("%s: ok %s", step, json.dumps(details, default=str))
         return True

@@ -129,6 +129,20 @@ def test_newest_scene_sorted_search(monkeypatch):
     assert calls[0]["filter"] == "eo:cloud_cover<=80"
 
 
+def test_newest_sentinel1_acquisition_has_no_cloud_filter(monkeypatch):
+    calls = []
+
+    class S:
+        def get(self, url, params=None, timeout=None):
+            calls.append((url, params))
+            return _Resp(200, {"features": [_item("2026-11-19T17:31:42Z", None)]})
+
+    monkeypatch.setattr(sch, "session", lambda: S())
+    assert sch.newest_scene("1,2,3,4", "2026-10-20T00:00:00Z", "sentinel-1-grd") == "2026-11-19T17:31:42Z"
+    url, params = calls[0]
+    assert "sentinel-1-grd" in url and "filter" not in params and params["sortby"] == "-properties.datetime"
+
+
 def test_newest_scene_pages_through_without_sort_support(monkeypatch):
     pages = {None: {"features": [_item("2026-11-01T10:00:00Z", 10), _item("2026-11-17T10:00:00Z", 95)],
                     "links": [{"rel": "next", "href": "page2"}]},
