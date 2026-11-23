@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .db import connect
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 _SCHEMA_SQL = Path(__file__).with_name("schema.sql")
 _MARK = "geomon schema "
 

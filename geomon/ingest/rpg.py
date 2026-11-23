@@ -1,9 +1,14 @@
 """RPG parcels (Registre parcellaire graphique) from the IGN Géoplateforme WFS.
 
 Every year from GEOMON_RPG_FIRST_YEAR (2015, the first year of the current
-nomenclature and of Sentinel-2) to GEOMON_RPG_YEAR is loaded: the latest from
-GEOMON_RPG_LAYER (RPG.LATEST), earlier ones from the layers RPG.<year>. The
-crop history of a parcel and the crop-group NDVI references need them all.
+nomenclature and of Sentinel-2) to the latest published is loaded (GEOMON_RPG_YEAR, when set,
+stops at that year): from the layers RPG.<year>, and the latest from GEOMON_RPG_LAYER (RPG.LATEST,
+whose title gives the year) until it has a layer of its own. The crop history of a parcel and the
+crop-group NDVI references need them all.
+
+A year's RPG is published about a year later: until then the current season uses the latest RPG's
+outlines (geomon.parcels). Step ``rpg-new``, run every week by the scheduler, loads a newly
+published year and recomputes what used the previous outlines in its place (:func:`after_new_years`).
 
 Parcel identifiers (id_parcel) are only unique within one year: parcels are
 renumbered and their outlines change from year to year.
@@ -28,31 +33,39 @@ from pathlib import Path
 from ..aoi import AOI
 from ..config import settings
 from ..db import connect
-from ..http import cached_download, session, wfs_features, wfs_layer_title
+from ..http import _wfs_capabilities, cached_download, session, wfs_features, wfs_layer_title
 
 log = logging.getLogger(__name__)
 
 
-def _check_year(layer: str, year: int) -> None:
-    """Make sure e.g. RPG.LATEST really holds the configured year."""
-    title = wfs_layer_title(f"{layer}:parcelles_graphiques") or ""
-    years = re.findall(r"\b(20\d\d)\b", title)
-    if years and int(years[0]) != year:
-        raise RuntimeError(
-            f"{layer} holds RPG {years[0]} ('{title}'), not {year}. "
-            "Set GEOMON_RPG_LAYER / GEOMON_RPG_YEAR accordingly."
-        )
-    log.info("RPG layer %s: %s", layer, title or "(title not found)")
+def published() -> dict[int, str]:
+    """The RPG years published on the Géoplateforme WFS and their layer: RPG.<year>, or
+    GEOMON_RPG_LAYER (RPG.LATEST) for the year in its title while it has no layer of its own; up to
+    GEOMON_RPG_YEAR when set."""
+    text = _wfs_capabilities()
+    out = {int(y): f"RPG.{y}" for y in re.findall(r"<Name>RPG\.(20\d\d):parcelles_graphiques</Name>", text)}
+    title = wfs_layer_title(f"{settings.rpg_layer}:parcelles_graphiques") or ""
+    m = re.search(r"\b(20\d\d)\b", title)
+    if m:
+        out.setdefault(int(m.group(1)), settings.rpg_layer)
+    return {y: layer for y, layer in out.items() if not settings.rpg_year or y <= settings.rpg_year}
+
+
+def last_year() -> int:
+    years = published()
+    if not years:
+        raise RuntimeError("No RPG layer found on the Géoplateforme WFS")
+    return max(years)
 
 
 def _layer(year: int) -> str:
-    return settings.rpg_layer if year == settings.rpg_year else f"RPG.{year}"
+    return published().get(year, f"RPG.{year}")
 
 
 def _codes(year: int) -> tuple[list[dict], int | None]:
     """Crop code list of a year. Layers before 2022 have none: the nearest later list is used
     (the nomenclature has been stable since 2015)."""
-    for y in range(year, settings.rpg_year + 1):
+    for y in range(year, last_year() + 1):
         layer = _layer(y)
         if wfs_layer_title(f"{layer}:codes_cultures") is not None:
             return wfs_features(f"{layer}:codes_cultures"), y
@@ -78,12 +91,11 @@ def _fill_groups(conn) -> None:
 
 
 def _load_year(aoi: AOI, year: int) -> dict:
-    layer = _layer(year)
-    if year == settings.rpg_year:
-        _check_year(layer, year)
-    elif wfs_layer_title(f"{layer}:parcelles_graphiques") is None:
-        log.warning("RPG %d: no layer %s on the WFS, skipped", year, layer)
+    if year not in published():
+        log.warning("RPG %d: not on the WFS, skipped", year)
         return {"year": year, "parcels": 0, "skipped": True}
+    layer = _layer(year)
+    log.info("RPG %d: layer %s", year, layer)
     codes, codes_year = _codes(year)
     parcels = wfs_features(f"{layer}:parcelles_graphiques", bbox_wgs84=aoi.bbox_wgs84)
 
@@ -267,13 +279,77 @@ def ilot_years() -> list[int]:
 
 
 def run(aoi: AOI) -> dict:
+    """Every RPG year again (and the îlots); a year new over the site recomputes what depends on it."""
+    before = site_years(aoi.code)
     years_ilots = ilot_years()
     resources = _resources() if any(y < ILOT_WFS_FIRST_YEAR for y in years_ilots) else None
     out_ilots = [_load_ilots(aoi, y, resources) for y in years_ilots]
-    years = list(range(min(settings.rpg_first_year, settings.rpg_year), settings.rpg_year + 1))
+    last = last_year()
+    years = list(range(min(settings.rpg_first_year, last), last + 1))
     out = [_load_year(aoi, y) for y in years]
     with connect() as conn:
         _fill_groups(conn)
+    after = site_years(aoi.code)
     return {"years": [r["year"] for r in out if r.get("parcels")],
             "parcels": {r["year"]: r["parcels"] for r in out},
-            "ilots": {r["year"]: r["ilots"] for r in out_ilots}}
+            "ilots": {r["year"]: r["ilots"] for r in out_ilots},
+            "recomputed": after_new_years(aoi.code, before, after) if before and set(after) - set(before) else {}}
+
+
+def site_years(site: str) -> list[int]:
+    """The RPG years loaded over a site (the parcels are loaded per site extent)."""
+    with connect() as conn:
+        return [r["year"] for r in conn.execute(
+            """SELECT DISTINCT year FROM ref.rpg_parcel
+               WHERE geom && (SELECT bbox FROM meta.aoi WHERE kind = 'site' AND code = %s) ORDER BY 1""",
+            (site,)).fetchall()]
+
+
+def run_new(aoi: AOI) -> dict:
+    """The RPG years published and not loaded over the site yet (everything the first time), then
+    what used other outlines in their place recomputed. Run every week: one capabilities request
+    when there is nothing new."""
+    loaded = site_years(aoi.code)
+    if not loaded:
+        return run(aoi)
+    todo = [y for y in sorted(published()) if y >= settings.rpg_first_year and y not in loaded]
+    if not todo:
+        return {"years": [loaded[0], loaded[-1]], "new": []}
+    out = [_load_year(aoi, y) for y in todo]
+    with connect() as conn:
+        _fill_groups(conn)
+    after = site_years(aoi.code)
+    new = sorted(set(after) - set(loaded))
+    log.info("RPG: new year(s) %s", new)
+    return {"years": [after[0], after[-1]], "new": new,
+            "recomputed": after_new_years(aoi.code, loaded, after) if new else {}}
+
+
+def after_new_years(site: str, before: list[int], after: list[int]) -> dict:
+    """After new RPG years over a site (its years ``before`` -> ``after``; the parcels are loaded per
+    site extent), what depends on the outlines of the seasons whose RPG year changed (their own RPG
+    replacing the latest one used in its place): the Sentinel-2 parcel statistics of the new years
+    (anything stored for them before their parcels were loaded over this site is cleared), curves
+    and crop-group curves, the obsolete statistics removed; the MODIS crop-group curves; and the
+    HR-VPP rows of those years (removed: the next clms-vpp run reads them again). Under the locks
+    of those steps."""
+    from .. import modis, modis_crops, parcels
+    from .lock import ingest_lock
+
+    seasons = parcels.changed_seasons(before, after, settings.rpg_first_year)
+    if not seasons:
+        return {}
+    log.info("RPG: seasons %s now use other outlines: recomputing", seasons)
+    out: dict = {"seasons": seasons}
+    with ingest_lock("sentinel2"):
+        with connect() as conn:
+            for y in sorted(set(after) - set(before)):
+                parcels.clear_site(conn, site, y)
+        out["sentinel2"] = parcels.sync(site)          # new outlines' statistics, stale seasons, pruned
+    if modis.years(site):
+        with ingest_lock("modis"):
+            out["modis"] = modis_crops.compute(site, seasons, rebuild_purity=True)   # the new outlines' cells
+    with connect() as conn:
+        out["hrvpp_rows_removed"] = conn.execute("DELETE FROM eo.parcel_vpp WHERE site = %s AND year = ANY(%s)",
+                                                 (site, seasons)).rowcount or 0
+    return out

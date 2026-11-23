@@ -2,12 +2,13 @@
 
 Three levels, each derived from the previous one:
 
-1. **Parcel-date statistics** (``eo.parcel_stats``, the history): for every stored
-   Sentinel-2 date, the mean and standard deviation of each index over the
-   interior of each RPG parcel (outline shrunk by 10 m, so that pixels mixing
-   the parcel with a hedge, a road or the next field are left out), clear pixels
-   only. A parcel-date is kept when at least half of its interior is clear; the
-   series use it when GEOMON_S2_PARCEL_MIN_CLEAR (80 %) is.
+1. **Parcel-date statistics** (geomon.fields: one Zarr store per RPG year and one for the farm's
+   fields, ``data/zarr/sites/<site>/fields/sentinel2/<layer>.zarr``): for every stored Sentinel-2
+   date, the mean and standard deviation of each index over each parcel and the share of its area
+   with a clear value, by geomon.zonal: every pixel weighted by its share inside the parcel's
+   outline shrunk by 10 m (pixels mixing the parcel with a hedge, a road or the next field left
+   out), or inside its whole outline when less than MIN_PIXELS pixels' area would remain (``edge``).
+   The series use a date when GEOMON_S2_PARCEL_MIN_CLEAR (80 %) of the area is clear.
 
 2. **Parcel-season curves** (``eo.parcel_season``): per parcel and season, a
    daily curve. GEOMON_S2_PARCEL_SMOOTHING chooses how:
@@ -40,8 +41,8 @@ one of the farm's plots take the farm's crop (status ``farm``, eo.farm_crop), in
 declaration or of an unknown crop (RPG not published yet).
 
 Better still, the farm's fields have their own series: their outlines (shrunk by 10 m, as the RPG
-parcels) are the parcels of a layer of their own, ``rpg_year`` 0 (FARM_LAYER) in eo.parcel_stats,
-parcel_season and parcel_info, with ids 'F' + a hash of the outline. In a season with a land-cover
+parcels) are the parcels of a layer of their own, ``rpg_year`` 0 (FARM_LAYER): its store ``farm``
+(geomon.fields), eo.parcel_season and parcel_info, with ids 'F' + a hash of the outline. In a season with a land-cover
 file, its fields replace the RPG parcels lying in them (eo.farm_crop: the fields with their crop, and
 the replaced RPG parcels without one), in every area: the communes and the group as the farm's own
 ("My plots"), which only has curves for those seasons, from its fields.
@@ -57,6 +58,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from . import fields, zonal
 from . import sentinel2 as s2
 from .arrays import quiet as _quiet
 from .config import settings
@@ -67,8 +69,10 @@ log = logging.getLogger(__name__)
 SEASON_DAYS = 488            # 1 Sept Y-1 .. 31 Dec Y (leap year)
 JAN1 = 122                   # day index of 1 January Y
 EDGE_BUFFER_M = 10           # outline shrunk by one pixel
-MIN_PIXELS = 4               # parcels with fewer interior pixels are ignored
-STORE_MIN_CLEAR = 0.5        # parcel-dates stored when at least half of the interior is clear
+MIN_PIXELS = 4               # parcels smaller than this many pixels' area are ignored; below it once
+                             # shrunk, a parcel is followed on its whole outline
+STORE_MIN_CLEAR = 0.5        # parcel-dates shown (not used) on the parcel's chart from half clear
+PRODUCT = "sentinel2"        # its stores in geomon.fields
 MIN_OBS = 4                  # observations needed for a season curve
 MAX_HALF_GAP = 30            # days farther than this from an observation stay empty
 # The curve of a season is smoothed over the season extended by PAD days on both sides, then cut:
@@ -80,7 +84,8 @@ PERMANENT_GROUPS = {"17", "18", "20", "21", "22", "23"}
 # Peak of the season's crop: 1 January to 31 August (later, the next crop may have been sown)
 PEAK_DAYS = (JAN1, JAN1 + 243)
 FARM_LAYER = 0               # rpg_year of the farm's own fields (ref.farm_landcover.field_id)
-# Tables: eo.parcel_stats, eo.parcel_dates, eo.parcel_season (geomon/schema.sql)
+# Tables: eo.parcel_season, eo.parcel_info, eo.group_season (geomon/schema.sql); the parcel-date
+# statistics are Zarr stores (geomon.fields)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +116,19 @@ def rpg_years(conn=None) -> list[int]:
         return q(conn)
     with connect() as c:
         return q(c)
+
+
+_LATEST: list = [0.0, None]
+
+
+def latest_rpg_year() -> int | None:
+    """The latest RPG year loaded (cached a minute: every map tile asks for it)."""
+    import time
+
+    if time.monotonic() - _LATEST[0] > 60:
+        years = rpg_years()
+        _LATEST[:] = [time.monotonic(), years[-1] if years else None]
+    return _LATEST[1]
 
 
 def geometry_year(season: int, years: list[int]) -> int | None:
@@ -182,104 +200,198 @@ def clear_labels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. Parcel-date statistics
+# 1. Parcel-date statistics (geomon.zonal, stored by geomon.fields)
 # ---------------------------------------------------------------------------
-def _date_rows(site: str, one: xr.Dataset, d: dt.date, todo: dict[int, list[str]]) -> list[tuple]:
-    """Statistics of one loaded date for the (RPG year -> indices) pairs to do."""
-    rows = []
-    cache: dict[str, np.ndarray] = {}
-    for gy, indices in todo.items():
-        lab, ids, npix = _labels(site, gy, one)
-        if not ids:
-            continue
-        for name in indices:
-            v = cache.get(name)
-            if v is None:
-                v = cache[name] = s2.index_array(one, name)
-            ok = np.isfinite(v) & (lab > 0)
-            lb, val = lab[ok], v[ok].astype("float64")
-            n = np.bincount(lb, minlength=len(ids) + 1)
-            sm = np.bincount(lb, weights=val, minlength=len(ids) + 1)
-            sq = np.bincount(lb, weights=val * val, minlength=len(ids) + 1)
-            keep = np.nonzero((npix >= MIN_PIXELS) & (n >= STORE_MIN_CLEAR * npix) & (n > 0))[0]
-            for k in keep[keep > 0]:
-                mean = sm[k] / n[k]
-                std = float(np.sqrt(max(sq[k] / n[k] - mean * mean, 0.0)))
-                rows.append((site, gy, ids[k - 1], name, d, float(mean), std, int(npix[k]), int(n[k])))
-    return rows
+def layer_name(rpg_year: int) -> str:
+    return "farm" if rpg_year == FARM_LAYER else f"rpg{rpg_year}"
 
 
-def _write_stats(site: str, rows: list[tuple], done: list[tuple]) -> None:
+def layer_year(name: str) -> int:
+    return FARM_LAYER if name == "farm" else int(name[3:])
+
+
+def _layer_sql(rpg_year: int) -> str:
+    """The fields of a layer (id, outline): an RPG year's parcels over the site (their point on surface
+    in it), or the farm's fields (FARM_LAYER: every year's outlines, one series per outline)."""
+    if rpg_year == FARM_LAYER:
+        return """SELECT DISTINCT ON (field_id) field_id AS id, geom FROM ref.farm_landcover
+                  WHERE site = %(site)s AND field_id IS NOT NULL ORDER BY field_id, year DESC"""
+    return """SELECT DISTINCT ON (p.parcel_id) p.parcel_id AS id, p.geom FROM ref.rpg_parcel p
+              JOIN meta.aoi a ON a.kind = 'site' AND a.code = %(site)s AND ST_Intersects(ST_PointOnSurface(p.geom), a.geom)
+              WHERE p.year = %(year)s ORDER BY p.parcel_id, p.surf_ha DESC NULLS LAST"""
+
+
+def layer_version(site: str, rpg_year: int) -> str:
+    """A layer's version (its ids and outlines), computed in the database without reading them."""
     with connect() as conn:
-        with conn.cursor() as cur:
-            sid = cur.execute("SELECT meta.site_id(%s) AS id", (site,)).fetchone()["id"]
-            cur.executemany("DELETE FROM eo.parcel_stats WHERE site_id = %s AND rpg_year = %s AND index = %s AND date = %s",
-                            [(sid, gy, ix, d) for gy, ix, d in done])
-            with cur.copy("COPY eo.parcel_stats (site_id, rpg_year, parcel_id, index, date, mean, std, n_pixels, n_clear) "
-                          "FROM STDIN") as cp:
-                for r in rows:
-                    cp.write_row((sid,) + tuple(r[1:]))
-            cur.executemany("INSERT INTO eo.parcel_dates (site, rpg_year, index, date) VALUES (%s, %s, %s, %s) "
-                            "ON CONFLICT DO NOTHING", [(site, gy, ix, d) for gy, ix, d in done])
+        r = conn.execute(f"""SELECT md5(string_agg(id || ':' || md5(ST_AsBinary(geom)), ',' ORDER BY id)) AS v
+                             FROM ({_layer_sql(rpg_year)}) f""", {"site": site, "year": rpg_year}).fetchone()
+    return f"{layer_name(rpg_year)}-{(r['v'] or 'empty')[:16]}"
 
 
-def _missing(site: str, years_rpg: list[int]) -> dict[dt.date, dict[int, list[str]]]:
-    """Stored dates whose parcel statistics are missing, per RPG year and index."""
+def field_layer(site: str, rpg_year: int) -> zonal.Layer:
+    """The fields of a layer with their outlines (see :func:`_layer_sql`)."""
     with connect() as conn:
-        have = {(r["rpg_year"], r["index"], r["date"]) for r in conn.execute(
-            "SELECT rpg_year, index, date FROM eo.parcel_dates WHERE site = %s", (site,)).fetchall()}
-    out: dict[dt.date, dict[int, list[str]]] = {}
+        rows = conn.execute(f"SELECT id, ST_AsBinary(geom) AS g FROM ({_layer_sql(rpg_year)}) f ORDER BY id",
+                            {"site": site, "year": rpg_year}).fetchall()
+    return zonal.Layer(layer_name(rpg_year), tuple(r["id"] for r in rows), tuple(bytes(r["g"]) for r in rows),
+                       version=layer_version(site, rpg_year))
+
+
+def _layers(site: str):
+    """Memos of the site's layer versions and of its layers (outlines read when first needed)."""
+    versions: dict[int, str] = {}
+    memo: dict[int, zonal.Layer] = {}
+
+    def version(rpg_year: int) -> str:
+        if rpg_year not in versions:
+            versions[rpg_year] = memo[rpg_year].key if rpg_year in memo else layer_version(site, rpg_year)
+        return versions[rpg_year]
+
+    def get(rpg_year: int) -> zonal.Layer:
+        if rpg_year not in memo:
+            memo[rpg_year] = field_layer(site, rpg_year)
+        return memo[rpg_year]
+    get.version = version
+    return get
+
+
+def _missing(site: str, years_rpg: list[int], layer_of) -> dict[dt.date, list[int]]:
+    """Stored dates not aggregated yet for a layer that uses them (for one of its indices, or for a
+    store of an older version of the layer): date -> RPG years (FARM_LAYER: the farm's fields)."""
     farm = set(farm_years(site))
-    stores = [(part, y) for part in s2.parts(site) for y in s2.years(site, part)]
-    for part, y in stores:
-        ds = s2.open_year(site, y, part)
-        indices = s2.available_indices(ds.data_vars)
-        for t in ds["time"].values.astype("datetime64[D]").astype(object):
-            gys = {geometry_year(s, years_rpg) for s in seasons_of(t, PAD)} - {None}
-            if farm & set(seasons_of(t, PAD)):
-                gys.add(FARM_LAYER)
-            for gy in gys:
-                todo = [ix for ix in indices if (gy, ix, t) not in have]
-                if todo:
-                    out.setdefault(t, {}).setdefault(gy, [])
-                    out[t][gy] = sorted(set(out[t][gy]) | set(todo))
+    have: dict[int, dict[str, set]] = {}
+
+    def done(gy: int) -> dict[str, set]:
+        if gy not in have:
+            ds = fields.open_store(site, PRODUCT, layer_name(gy))
+            current = ds is not None and ds.attrs.get("layer_key") == layer_of.version(gy)
+            have[gy] = {ix: fields.done(ds, ix) for ix in s2.INDICES} if current else {}
+        return have[gy]
+
+    out: dict[dt.date, list[int]] = {}
+    for part in s2.parts(site):
+        for y in s2.years(site, part):
+            ds = s2.open_year(site, y, part)
+            indices = s2.available_indices(ds.data_vars)
+            for t in ds["time"].values.astype("datetime64[D]"):
+                d = t.astype(object)
+                gys = {geometry_year(s, years_rpg) for s in seasons_of(d, PAD)} - {None}
+                if farm & set(seasons_of(d, PAD)):
+                    gys.add(FARM_LAYER)
+                for gy in gys:
+                    if any(t not in done(gy).get(ix, ()) for ix in indices) and gy not in out.get(d, []):
+                        out.setdefault(d, []).append(gy)
     return out
 
 
 def store_missing_stats(site: str) -> set[int]:
-    """Computes the parcel statistics of every stored date not done yet; returns the seasons touched."""
+    """Aggregates every stored date not done yet for the layers using it (all the indices of the
+    date, every part of the site summed); returns the seasons touched."""
     years_rpg = rpg_years()
     if not years_rpg:
         log.info("Parcels: no RPG loaded, skipped")
         return set()
-    missing = _missing(site, years_rpg)
+    layer_of = _layers(site)
+    missing = _missing(site, years_rpg, layer_of)
     if not missing:
         return set()
     farm = set(farm_years(site))
-    log.info("Parcels: statistics of %d dates to compute", len(missing))
+    log.info("Parcels: %d dates to aggregate", len(missing))
     touched: set[int] = set()
     by_year: dict[int, list[dt.date]] = {}
     for d in sorted(missing):
         by_year.setdefault(d.year, []).append(d)
-    n_rows = 0
     for y, dates in by_year.items():
         stores = {part: s2.open_year(site, y, part) for part in s2.parts(site)}
         stores = {k: v for k, v in stores.items() if v is not None}
         times = {k: v["time"].values.astype("datetime64[D]") for k, v in stores.items()}
-        rows, done = [], []
+        grids = {k: zonal.Grid.of(v) for k, v in stores.items()}
+
+        def cover(gy: int, part: str) -> zonal.Coverage:
+            return zonal.coverage(layer_of(gy), grids[part], EDGE_BUFFER_M, MIN_PIXELS)
+
+        sums: dict[int, dict[dt.date, list]] = {}      # RPG year -> date -> [num, sq, den] (fields x indices)
+        indices_of: dict[dt.date, list[str]] = {}
         for d in dates:
-            for part, ds in stores.items():         # the parcels of each part are on its own grid
+            for part, ds in stores.items():               # each part on its own grid: the sums add
                 hit = np.nonzero(times[part] == np.datetime64(d, "D"))[0]
-                if hit.size:
-                    rows += _date_rows(site, ds.isel(time=int(hit[0])).load(), d, missing[d])
-            done += [(gy, ix, d) for gy, ixs in missing[d].items() for ix in ixs]
+                if not hit.size:
+                    continue
+                one = ds.isel(time=int(hit[0])).load()
+                indices = indices_of.setdefault(d, s2.available_indices(one.data_vars))
+                values = np.stack([s2.index_array(one, ix).ravel() for ix in indices])
+                for gy in missing[d]:
+                    r = cover(gy, part).sums(values)
+                    acc = sums.setdefault(gy, {}).get(d)
+                    sums[gy][d] = list(r) if acc is None else [a + b for a, b in zip(acc, r)]
             touched |= {s for s in seasons_of(d, PAD) if geometry_year(s, years_rpg) in missing[d]
                         or (FARM_LAYER in missing[d] and s in farm)}
-        _write_stats(site, rows, done)
-        n_rows += len(rows)
-        log.info("Parcels %d: %d dates, %d parcel-dates", y, len(dates), len(rows))
-    log.info("Parcels: %d parcel-dates stored", n_rows)
+        for gy, by_date in sums.items():
+            layer = layer_of(gy)
+            covers = [cover(gy, part) for part in stores]
+            total = np.sum([c.cells for c in covers], axis=0)
+            edge = np.any([c.edge for c in covers], axis=0)
+            days = sorted(by_date)
+            if any(indices_of[d] != indices_of[days[0]] for d in days):
+                raise RuntimeError(f"Sentinel-2 {y}: the parts or dates of a year hold different bands")
+            data = {}
+            for k, ix in enumerate(indices_of[days[0]]):
+                cols = [by_date[d] for d in days]
+                num, sq, den = (np.stack([c[j][:, k] for c in cols], axis=1) for j in range(3))
+                data[ix] = zonal.finish(num, sq, den, total)
+            fields.merge(site, PRODUCT, layer, total, edge, [np.datetime64(d, "D") for d in days], data)
+            log.info("Parcels %d, %s: %d dates aggregated over %d fields", y, layer.name, len(days), len(layer))
     return touched
+
+
+def _season_observations(site: str, season: int, gy: int, farm_fields: list[str]) -> pd.DataFrame:
+    """The clear observations of a season (with PAD days on both sides) on its layer and the farm's
+    fields of its land cover: index, rpg_year, parcel_id, date, mean, n_pixels (the area followed)."""
+    d0, d1 = season_start(season) - dt.timedelta(PAD), season_end(season) + dt.timedelta(PAD)
+    frames = []
+    for ry, ids in ((gy, None), (FARM_LAYER, farm_fields)):
+        if ry == FARM_LAYER and not ids:
+            continue
+        for ix in s2.INDICES:
+            tab = fields.table(site, PRODUCT, layer_name(ry), ix, d0, d1, ids)
+            if tab is None:
+                continue
+            dates, fids, mean, valid, cells = tab
+            with np.errstate(invalid="ignore"):
+                ok = (valid >= settings.s2_parcel_min_clear) & np.isfinite(mean) & (cells >= MIN_PIXELS)[None, :]
+            ti, fi = np.nonzero(ok)
+            frames.append(pd.DataFrame({"index": ix, "rpg_year": ry, "parcel_id": fids[fi], "date": dates[ti],
+                                        "mean": mean[ti, fi].astype("float64"), "n_pixels": cells[fi]}))
+    if not frames:
+        return pd.DataFrame(columns=["index", "rpg_year", "parcel_id", "date", "mean", "n_pixels"])
+    return pd.concat(frames, ignore_index=True).sort_values(["index", "rpg_year", "parcel_id", "date"], kind="stable")
+
+
+def field_observations(site: str, index: str, rpg_year: int, parcel_id: str, d0: dt.date, d1: dt.date) -> pd.DataFrame:
+    """A parcel's (or the farm's field's, FARM_LAYER) dates over a period: date, mean, std, valid."""
+    return fields.series(site, PRODUCT, layer_name(rpg_year), parcel_id, index, d0, d1)
+
+
+def group_observations(site: str, index: str, members: dict[int, list[str]], d0: dt.date, d1: dt.date,
+                       weighted: bool = True) -> list[tuple[dt.date, float, int]]:
+    """Per date, the mean of the clear observations of some parcels (RPG year -> ids), weighted by
+    their area (``weighted``) or one parcel one vote, and their number."""
+    acc: dict[dt.date, list[float]] = {}
+    for ry, ids in members.items():
+        tab = fields.table(site, PRODUCT, layer_name(ry), index, d0, d1, ids) if ids else None
+        if tab is None:
+            continue
+        dates, _, mean, valid, cells = tab
+        with np.errstate(invalid="ignore"):
+            ok = (valid >= settings.s2_parcel_min_clear) & np.isfinite(mean)
+        w = np.where(ok, cells[None, :] if weighted else 1.0, 0.0)
+        s, n, c = (np.where(ok, mean, 0.0) * w).sum(axis=1), w.sum(axis=1), ok.sum(axis=1)
+        for d, a, b, k in zip(dates, s, n, c):
+            if k:
+                v = acc.setdefault(d, [0.0, 0.0, 0])
+                v[0], v[1], v[2] = v[0] + a, v[1] + b, v[2] + int(k)
+    return [(d, v[0] / v[1], v[2]) for d, v in sorted(acc.items()) if v[1] > 0]
 
 
 # ---------------------------------------------------------------------------
@@ -364,27 +476,16 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
     if not years_rpg:
         return 0
     if seasons is None:
-        with connect() as conn:
-            first = conn.execute("SELECT min(date) AS d FROM eo.parcel_dates WHERE site = %s", (site,)).fetchone()["d"]
-        if first is None:
+        stored = s2.years(site)
+        if not stored:
             return 0
-        seasons = set(range(first.year, max(current_seasons()) + 1))
+        seasons = set(range(stored[0], max(current_seasons()) + 1))
     n = 0
     for season in sorted(seasons):
         gy = geometry_year(season, years_rpg)
         if gy is None:
             continue
-        fields = season_fields(site, season)
-        with connect() as conn:
-            obs = pd.DataFrame(conn.execute(
-                """SELECT index, rpg_year, parcel_id, date, mean, n_pixels FROM eo.parcel_stats
-                   WHERE site_id = meta.site_key_of(%(site)s) AND (rpg_year = %(gy)s OR (rpg_year = %(farm)s AND parcel_id = ANY(%(fields)s)))
-                     AND date BETWEEN %(d0)s AND %(d1)s AND n_clear >= %(min_clear)s * n_pixels
-                   ORDER BY index, rpg_year, parcel_id, date""",
-                {"site": site, "gy": gy, "farm": FARM_LAYER, "fields": fields,
-                 "d0": season_start(season) - dt.timedelta(PAD), "d1": season_end(season) + dt.timedelta(PAD),
-                 "min_clear": settings.s2_parcel_min_clear},
-            ).fetchall())
+        obs = _season_observations(site, season, gy, season_fields(site, season))
         rows = []
         if len(obs):
             obs["t"] = [(d - season_start(season)).days + PAD for d in obs["date"]]
@@ -405,7 +506,7 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
                 rows.append((site, season, ix, pid, int(ry), len(inside), season_start(season) + dt.timedelta(int(inside[0])),
                              season_start(season) + dt.timedelta(int(inside[-1])), None if k is None else float(z[k]),
                              None if k is None else season_start(season) + dt.timedelta(k),
-                             z.astype("<f4").tobytes(), int(g["n_pixels"].max())))
+                             z.astype("<f4").tobytes(), int(round(float(g["n_pixels"].max())))))
         with connect() as conn:
             conn.execute("DELETE FROM eo.parcel_season WHERE site = %s AND season = %s", (site, season))
             with conn.cursor() as cur:
@@ -419,12 +520,39 @@ def compute_seasons(site: str, seasons: set[int] | None = None) -> int:
 
 
 def clear_site(conn, site: str, rpg_year: int | None = None) -> None:
-    """A site's parcel rows (statistics, dates processed, curves, parcel info), of one RPG layer or all."""
+    """A site's parcel statistics (stores), curves and parcel info, of one RPG layer or all."""
+    fields.remove(site, PRODUCT, None if rpg_year is None else layer_name(rpg_year))
     layer = "" if rpg_year is None else " AND rpg_year = %s"
     args = (site,) if rpg_year is None else (site, rpg_year)
-    conn.execute(f"DELETE FROM eo.parcel_stats WHERE site_id = meta.site_key_of(%s){layer}", args)
-    for t in ("parcel_dates", "parcel_season", "parcel_info"):
+    for t in ("parcel_season", "parcel_info"):
         conn.execute(f"DELETE FROM eo.{t} WHERE site = %s{layer}", args)
+
+
+def changed_seasons(before: list[int], after: list[int], first: int = 2015) -> list[int]:
+    """The seasons (``first`` to the current ones) whose RPG outlines differ between two lists of
+    RPG years loaded: a new year's own season, and the later ones that used the latest RPG."""
+    return [s for s in range(first, max(current_seasons()) + 1) if geometry_year(s, before) != geometry_year(s, after)]
+
+
+def unused_layers(pairs, years_rpg: list[int]) -> list[tuple[int, dt.date]]:
+    """The (RPG year, date) of statistics that no season of their date uses (FARM_LAYER kept)."""
+    return [(y, d) for y, d in pairs
+            if y != FARM_LAYER and y not in {geometry_year(s, years_rpg) for s in seasons_of(d, PAD)}]
+
+
+def prune_stats(site: str, years_rpg: list[int]) -> int:
+    """Removes the dates of the RPG layers that no season of the date uses any more (the latest RPG's,
+    used for a season until its own RPG was published; a year no longer loaded). Returns the number
+    of layer-dates removed."""
+    n = 0
+    for name in fields.layers(site, PRODUCT):
+        y = layer_year(name)
+        if y == FARM_LAYER:
+            continue
+        n += fields.keep_dates(site, PRODUCT, name, lambda d, y=y: not unused_layers([(y, d)], years_rpg))
+    if n:
+        log.info("Parcels: %d layer-dates of outlines no longer used removed", n)
+    return n
 
 
 def sync(site: str, full: bool = False) -> dict:
@@ -442,6 +570,7 @@ def sync(site: str, full: bool = False) -> dict:
     finally:
         clear_labels()      # parcel rasters of every RPG year: not kept by the long-running scheduler
     years_rpg = rpg_years()
+    prune_stats(site, years_rpg)
     with connect() as conn:
         stale = {r["season"] for r in conn.execute(
             "SELECT DISTINCT season, rpg_year FROM eo.parcel_season WHERE site = %s", (site,)).fetchall()

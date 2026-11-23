@@ -65,7 +65,8 @@ class Settings:
     # Source vintages
     cog_vintage: int = field(default_factory=lambda: int(_env("GEOMON_COG_VINTAGE", "2026")))
     rpg_layer: str = field(default_factory=lambda: _env("GEOMON_RPG_LAYER", "RPG.LATEST"))
-    rpg_year: int = field(default_factory=lambda: int(_env("GEOMON_RPG_YEAR", "2025")))
+    # Last RPG year loaded: the latest published when unset (0); a year stops there
+    rpg_year: int = field(default_factory=lambda: int(_env("GEOMON_RPG_YEAR", "0") or 0))
     # Earlier RPG years are loaded too (layers RPG.<year>), for the crop history of each parcel
     rpg_first_year: int = field(default_factory=lambda: int(_env("GEOMON_RPG_FIRST_YEAR", "2015")))
     # RPG 1.0 îlots (majority crop group), from this year to 2014: 2010-2014 from the WFS, 2007-2009

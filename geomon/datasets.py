@@ -100,9 +100,10 @@ DATASETS: dict[str, Dataset] = {d.code: d for d in (
             "Communes, EPCI, départements, regions (IGN ADMIN EXPRESS, COG). Shared by the sites.",
             ("admin",), default="frozen", refresh_days=90, shared=True),
     Dataset("rpg", "Agricultural parcels (RPG)", "context",
-            "RPG parcels and crops since 2015, farm îlots 2007-2014 (IGN). Shared by the sites. "
-            "After an update, recompute the parcel and MODIS crop curves.",
-            ("rpg",), default="frozen", refresh_days=30, shared=True),
+            "RPG parcels and crops since 2015, farm îlots 2007-2014 (IGN). Shared by the sites. Checked "
+            "every week: a newly published year is loaded, and the seasons that used the previous year's "
+            "outlines in its place are recomputed (parcel series, crop-group curves, HR-VPP).",
+            ("rpg-new",), shared=True, schedule=Every(days=7)),
     Dataset("osm", "OpenStreetMap", "context", "Roads, buildings, land use, water, places (Overpass).",
             ("osm",), default="frozen", refresh_days=30,
             delete_sql=("DELETE FROM ref.osm_feature WHERE site = %(site)s",)),
@@ -192,6 +193,11 @@ DATASETS: dict[str, Dataset] = {d.code: d for d in (
     Dataset("mf_etp", "Météo-France ETP (grid)", "weather",
             "Daily Penman-Monteith ETP on a 0.125° grid since 1970. No account.",
             ("mf-etp",), stores=("zarr/sites/{site}/weather/mf_etp.zarr",), schedule=Daily(8, 30)),
+    Dataset("clms_soil", "Soil moisture (Copernicus, 1 km)", "weather",
+            "Surface soil moisture from Sentinel-1 (since 2014) and the Soil Water Index at five depths down to the "
+            "root zone, 1 km, daily, from the Copernicus Land Monitoring Service (openEO, the Sentinel-2 login).",
+            ("clms-soil",), stores=("zarr/sites/{site}/weather/clms_ssm.zarr", "zarr/sites/{site}/weather/clms_swi.zarr"),
+            requires=("openeo",), schedule=Daily(9, 0)),
     Dataset("agera5", "AgERA5", "weather", "Copernicus agro-meteorological daily data, 0.1°.",
             ("agera5",), stores=("zarr/sites/{site}/weather/agera5.zarr", "raw/agera5/{site}"), requires=("cds",), schedule=Every(hours=6)),
     Dataset("era5land", "ERA5-Land", "weather", "Copernicus hourly reanalysis, 0.1°.",
@@ -201,15 +207,22 @@ DATASETS: dict[str, Dataset] = {d.code: d for d in (
                                             "raw/era5/{site}"), requires=("cds",), schedule=Every(hours=6)),
     # Satellite
     Dataset("sentinel2", "Sentinel-2 L2A", "satellite", "Optical images, 10 m, since 2015 (openEO).",
-            ("sentinel2",), stores=("zarr/sentinel2/{site}", "raw/sentinel2/{site}"),
+            ("sentinel2",), stores=("zarr/sentinel2/{site}", "raw/sentinel2/{site}", "zarr/sites/{site}/fields/sentinel2"),
             delete_sql=(f"DELETE FROM eo.index_stats WHERE site = %(site)s AND index = ANY({_S2})",
-                        "DELETE FROM eo.parcel_stats WHERE site_id = meta.site_key_of(%(site)s)",
-                        "DELETE FROM eo.parcel_dates WHERE site = %(site)s",
                         "DELETE FROM eo.parcel_season WHERE site = %(site)s",
                         f"DELETE FROM eo.group_season WHERE site = %(site)s AND index = ANY({_S2})"), requires=("openeo",), schedule=NewScene("sentinel-2-l2a")),
     Dataset("sentinel1", "Sentinel-1 GRD", "satellite", "Radar backscatter, 10 m, since 2023 (openEO).",
             ("sentinel1",), stores=("zarr/sentinel1/{site}", "raw/sentinel1/{site}"),
             delete_sql=(f"DELETE FROM eo.index_stats WHERE site = %(site)s AND index = ANY({_S1})",), requires=("openeo",), schedule=NewScene("sentinel-1-grd")),
+    Dataset("clms_dmp", "Dry matter productivity (Copernicus, 300 m)", "satellite",
+            "Biomass growth (kg of dry matter per hectare and day) every 10 days since 2014, from the Copernicus "
+            "Land Monitoring Service (openEO, the Sentinel-2 login).",
+            ("clms-dmp",), stores=("zarr/sites/{site}/dmp.zarr",), requires=("openeo",), schedule=Every(days=2)),
+    Dataset("clms_vpp", "Vegetation phenology per parcel (Copernicus HR-VPP, 10 m)", "satellite",
+            "Start, peak and end of each parcel's season, its length, peak and productivity, yearly since 2017 "
+            "(Copernicus HR-VPP, openEO, the Sentinel-2 login).",
+            ("clms-vpp",), delete_sql=("DELETE FROM eo.parcel_vpp WHERE site = %(site)s",), requires=("openeo",),
+            schedule=Every(days=30)),
     Dataset("modis", "MODIS NDVI", "satellite", "Terra and Aqua 16-day NDVI, 250 m, since 2000.",
             ("modis",), stores=("zarr/modis/{site}",),
             delete_sql=("DELETE FROM eo.index_stats WHERE site = %(site)s AND index = 'modis_ndvi'",

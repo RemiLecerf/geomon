@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
 from ..config import settings
+from ..parcels import latest_rpg_year
 from ..db import connect
 
 router = APIRouter(prefix="/api/tiles", tags=["tiles"])
@@ -78,7 +79,7 @@ def tile(layer: str, z: int, x: int, y: int, year: int | None = None) -> bytes:
     _check(z, x, y)
     params = {"z": z, "x": x, "y": y, "site": settings.site_code}
     if layer == "rpg":
-        params["year"] = year or settings.rpg_year
+        params["year"] = year or latest_rpg_year() or settings.rpg_first_year
         sql = _ILOT_SQL if params["year"] < settings.rpg_first_year else _RPG_SQL
     elif layer in OSM_LAYERS:
         sql, params["layer"] = _OSM_SQL, layer

@@ -19,10 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from .. import __version__, units
+from .. import parcels as pc
 from ..config import _current, all_sites, settings
 from ..db import connect
 from ..migrate import migrate
-from . import datasets, mf_live, mf_models, modis, nowcast, radar, rasters, sentinel1, sentinel2, soils, tiles, weather
+from . import clms, datasets, mf_live, mf_models, modis, nowcast, radar, rasters, sentinel1, sentinel2, soils, tiles, weather
 from .areas import area as _area
 from .areas import site_row as _site
 
@@ -58,6 +59,7 @@ app.include_router(sentinel1.router)
 app.include_router(modis.router)
 app.include_router(radar.router)
 app.include_router(nowcast.router)
+app.include_router(clms.router)
 app.include_router(mf_live.router)
 app.include_router(mf_models.router)
 app.include_router(datasets.router)
@@ -283,7 +285,7 @@ def admin_geojson(levels: str = "COM,EPCI") -> JSONResponse:
 @app.get("/api/rpg.geojson")
 def rpg_geojson(year: int | None = None) -> JSONResponse:
     """Parcels of the download extent; ``in_commune``: the parcel touches one of the AOI communes."""
-    year = year or settings.rpg_year
+    year = year or pc.latest_rpg_year() or settings.rpg_first_year
     with connect() as conn:
         rows = conn.execute(
             """SELECT p.id, p.year, p.parcel_id, p.code_cultu, c.label AS crop,
@@ -308,14 +310,14 @@ def rpg_years() -> dict:
             f"SELECT DISTINCT year FROM ref.rpg_parcel WHERE geom && {bbox} ORDER BY 1", (settings.site_code,)).fetchall()]
         ilots = [r["year"] for r in conn.execute(
             f"SELECT DISTINCT year FROM ref.rpg_ilot WHERE geom && {bbox} ORDER BY 1", (settings.site_code,)).fetchall()]
-    return {"parcels": parcels, "ilots": [y for y in ilots if y not in parcels], "latest": settings.rpg_year}
+    return {"parcels": parcels, "ilots": [y for y in ilots if y not in parcels], "latest": parcels[-1] if parcels else None}
 
 
 @app.get("/api/rpg/summary")
 def rpg_summary(year: int | None = None, area: str | None = None) -> dict:
     """Crop areas inside an area (parcels clipped to the commune or group outline). Before 2015, the
     areas of the îlots by their majority crop group (``ilots``: true)."""
-    year = year or settings.rpg_year
+    year = year or pc.latest_rpg_year() or settings.rpg_first_year
     if year < settings.rpg_first_year:
         return _ilot_summary(year, area)
     with connect() as conn:

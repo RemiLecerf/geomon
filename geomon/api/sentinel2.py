@@ -304,31 +304,29 @@ def crop(group: str, season: int, index: str = "ndvi", area: str | None = None, 
     years_rpg = pc.rpg_years()
     gy = pc.geometry_year(season, years_rpg)
     with connect() as conn:
-        rows = conn.execute(
-            f"""SELECT s.date, {"sum(s.mean * s.n_pixels) / sum(s.n_pixels)" if weight == "pixels" else "avg(s.mean)"}
-                      AS mean, count(*) AS n
-               FROM eo.parcel_stats s
-               JOIN eo.parcel_season c ON c.site = %(site)s AND c.season = %(season)s AND c.index = s.index
-                                      AND c.parcel_id = s.parcel_id AND c.rpg_year = s.rpg_year
-               JOIN eo.parcel_info i ON i.site = %(site)s AND i.rpg_year = s.rpg_year AND i.parcel_id = s.parcel_id
-               LEFT JOIN eo.farm_crop fc ON fc.site = %(site)s AND fc.season = %(season)s AND fc.rpg_year = s.rpg_year
-                                        AND fc.parcel_id = s.parcel_id
-               WHERE s.site_id = meta.site_key_of(%(site)s) AND s.index = %(index)s AND s.rpg_year IN (%(gy)s, %(farm_layer)s)
-                 AND s.date BETWEEN %(d0)s AND %(d1)s AND s.n_clear >= %(min_clear)s * s.n_pixels
-                 AND %(area)s = ANY(i.areas)
+        members = conn.execute(
+            """SELECT c.rpg_year, c.parcel_id
+               FROM eo.parcel_season c
+               JOIN eo.parcel_info i ON i.site = c.site AND i.rpg_year = c.rpg_year AND i.parcel_id = c.parcel_id
+               LEFT JOIN eo.farm_crop fc ON fc.site = c.site AND fc.season = c.season AND fc.rpg_year = c.rpg_year
+                                        AND fc.parcel_id = c.parcel_id
+               WHERE c.site = %(site)s AND c.season = %(season)s AND c.index = %(index)s
+                 AND c.rpg_year IN (%(gy)s, %(farm_layer)s) AND %(area)s = ANY(i.areas)
                  AND (%(area)s <> 'farm' OR fc.parcel_id IS NOT NULL OR NOT %(farm_lc)s)
                  AND CASE WHEN fc.parcel_id IS NOT NULL THEN fc.code_group = %(group)s      -- the farm's crop
-                          ELSE i.code_group = %(group)s AND (i.rpg_year = %(season)s OR i.code_group = ANY(%(permanent)s)) END
-               GROUP BY s.date ORDER BY s.date""",
+                          ELSE i.code_group = %(group)s AND (i.rpg_year = %(season)s OR i.code_group = ANY(%(permanent)s)) END""",
             {"site": site, "index": index, "gy": gy, "season": season, "group": group, "area": area,
-             "d0": pc.season_start(season), "d1": pc.season_end(season), "min_clear": settings.s2_parcel_min_clear,
              "permanent": sorted(pc.PERMANENT_GROUPS), "farm_lc": bool(pc.farm_years(site)),
              "farm_layer": pc.FARM_LAYER},
         ).fetchall()
+    by_layer: dict[int, list[str]] = {}
+    for r in members:
+        by_layer.setdefault(r["rpg_year"], []).append(r["parcel_id"])
+    rows = pc.group_observations(site, index, by_layer, pc.season_start(season), pc.season_end(season),
+                                 weighted=weight == "pixels")
     need = max(1, min(3, round(0.3 * cur["parcels"])))
-    out["observations"] = [{"date": str(r["date"]), "day": pc.day_of_season(r["date"], season),
-                            "mean": round(float(r["mean"]), 3), "parcels": r["n"]}
-                           for r in rows if r["n"] >= need]
+    out["observations"] = [{"date": str(d), "day": pc.day_of_season(d, season), "mean": round(float(m), 3), "parcels": n}
+                           for d, m, n in rows if n >= need]
     return out
 
 
@@ -431,12 +429,8 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
     season = season if season in curves else (this_year if this_year in curves else max(curves))
     sel = next(e for e in history if e["season"] == season)
     gy = sel["rpg_year"]
-    with connect() as conn:
-        obs = conn.execute(
-            """SELECT date, mean, std, n_clear, n_pixels FROM eo.parcel_stats
-               WHERE site_id = meta.site_key_of(%s) AND index = %s AND rpg_year = %s AND parcel_id = %s AND date BETWEEN %s AND %s
-               ORDER BY date""",
-            (site, index, gy, sel["parcel_id"], pc.season_start(season), pc.season_end(season))).fetchall()
+    obs = pc.field_observations(site, index, gy, sel["parcel_id"], pc.season_start(season), pc.season_end(season))
+    obs = obs[obs["valid"] >= pc.STORE_MIN_CLEAR].to_dict("records")         # half clear or more: shown
     group = sel["code_group"] or sel["last_known_group"]
     by_season = {e["season"]: e for e in history}
     own = {s: c for s, c in curves.items() if s < season and by_season[s].get("code_group") == group}
@@ -447,11 +441,18 @@ def parcel(lon: float, lat: float, index: str = "ndvi", season: int | None = Non
            "curve": pc.nan_list(curves[season]),
            "observations": [{"date": str(o["date"]), "day": pc.day_of_season(o["date"], season),
                              "mean": round(float(o["mean"]), 3), "std": round(float(o["std"] or 0), 3),
-                             "clear_fraction": round(o["n_clear"] / o["n_pixels"], 3),
-                             "used": o["n_clear"] >= settings.s2_parcel_min_clear * o["n_pixels"]} for o in obs],
+                             "clear_fraction": round(float(o["valid"]), 3),
+                             "used": bool(o["valid"] >= settings.s2_parcel_min_clear)} for o in obs],
            "own": None}
     if len(own) >= 2:
         with pc._quiet():
             mean = np.nanmean(np.stack(list(own.values())), axis=0)
         out["own"] = {"seasons": sorted(own), "mean": pc.nan_list(mean)}
+    from .clms import parcel_vpp
+
+    vpp = parcel_vpp(site, season, gy, sel["parcel_id"])
+    if vpp:                       # Copernicus HR-VPP season of the parcel, on the chart's day axis
+        for k in ("sos", "peak", "eos"):
+            vpp[f"{k}_day"] = pc.day_of_season(dt.date.fromisoformat(vpp[k]), season) if vpp.get(k) else None
+    out["vpp"] = vpp
     return out

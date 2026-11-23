@@ -72,6 +72,10 @@ PRODUCTS: dict[str, Product] = {
                 "Météo-France, Données climatologiques de base - quotidiennes", "day", "stations", kind="stations"),
         Product("comephore", "COMEPHORE rainfall reanalysis (radar and rain gauges)",
                 "Météo-France, Réanalyses Coméphore (hourly, summed over UTC days)", "day", "1 km"),
+        Product("clms_ssm", "CLMS surface soil moisture (Sentinel-1)",
+                "Copernicus Land Monitoring Service, Surface Soil Moisture Europe 1 km daily (CDSE openEO)", "day", "1 km"),
+        Product("clms_swi", "CLMS Soil Water Index",
+                "Copernicus Land Monitoring Service, Soil Water Index Europe 1 km daily (CDSE openEO)", "day", "1 km"),
         Product("mf_etp", "Météo-France Penman-Monteith ETP (grid)",
                 "Météo-France, Données ETP spatialisées quotidiennes", "day", "0.125° (~12 km)"),
     )
@@ -90,6 +94,8 @@ SERIES = {
     "stations": {"label": "Météo-France stations (measured)", "history": "mf_stations", "forecast": None},
     "comephore": {"label": "COMEPHORE (radar + rain gauges, 1 km)", "history": "comephore", "forecast": None},
     "mf_etp": {"label": "Météo-France ETP (grid, 12 km)", "history": "mf_etp", "forecast": None},
+    "clms_ssm": {"label": "CLMS surface soil moisture (Sentinel-1, 1 km)", "history": "clms_ssm", "forecast": None},
+    "clms_swi": {"label": "CLMS Soil Water Index (1 km)", "history": "clms_swi", "forecast": None},
 }
 STATIONS_MAX_KM = 40.0          # stations farther than this from the area are not used
 
@@ -233,6 +239,12 @@ DAILY_VARS: list[DailyVar] = [
     DailyVar("soil_m_28_100", "Soil moisture 28–100 cm", "m**3/m**3", "mean"),
     DailyVar("soil_m_100_255", "Soil moisture 100–255 cm", "m**3/m**3", "mean"),
     DailyVar("swi", "Soil wetness index (SIM2)", "dimensionless", "mean"),
+    DailyVar("ssm", "Surface soil moisture, Sentinel-1 (CLMS, top few cm, % of saturation)", "percent", "mean"),
+    DailyVar("swi002", "Soil Water Index T=2, near the surface (CLMS, % of saturation)", "percent", "mean"),
+    DailyVar("swi010", "Soil Water Index T=10 (CLMS)", "percent", "mean"),
+    DailyVar("swi020", "Soil Water Index T=20 (CLMS)", "percent", "mean"),
+    DailyVar("swi040", "Soil Water Index T=40 (CLMS)", "percent", "mean"),
+    DailyVar("swi100", "Soil Water Index T=100, root zone (CLMS)", "percent", "mean"),
     DailyVar("wg_root", "Liquid water content of the root zone at 06 UTC (SIM2)", "m**3/m**3", "mean"),
     DailyVar("evap", "Actual evapotranspiration (SIM2; ERA5 from the latent heat flux)", "mm", "sum"),
     DailyVar("drainage", "Drainage (SIM2)", "mm", "sum"),

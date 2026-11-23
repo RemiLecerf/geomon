@@ -112,15 +112,22 @@ def wfs_features(
     return features
 
 
-@lru_cache(maxsize=1)
+WFS_CAPABILITIES_TTL_S = 6 * 3600
+_CAPABILITIES: list = [0.0, None]
+
+
 def _wfs_capabilities() -> str:
-    r = session().get(
-        IGN_WFS,
-        params={"SERVICE": "WFS", "VERSION": "2.0.0", "REQUEST": "GetCapabilities"},
-        timeout=300,
-    )
-    r.raise_for_status()
-    return r.text
+    """The Géoplateforme WFS capabilities (5 MB), read again after six hours: the scheduler runs for
+    months and must see a newly published layer (a new RPG year)."""
+    if _CAPABILITIES[1] is None or time.monotonic() - _CAPABILITIES[0] > WFS_CAPABILITIES_TTL_S:
+        r = session().get(
+            IGN_WFS,
+            params={"SERVICE": "WFS", "VERSION": "2.0.0", "REQUEST": "GetCapabilities"},
+            timeout=300,
+        )
+        r.raise_for_status()
+        _CAPABILITIES[:] = [time.monotonic(), r.text]
+    return _CAPABILITIES[1]
 
 
 def wfs_layer_title(typename: str) -> str | None:

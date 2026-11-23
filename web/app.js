@@ -425,6 +425,7 @@ function setArea(code, fit = false) {
   updateAreaSummary().catch((err) => { $("#area-summary").innerHTML = `<p class="muted">${esc(err.message)}</p>`; });
   if (wx.catalogue) setWeatherLocation(wx.lngLat, !wx.lngLat);  // the area average follows the area
   updateS2().catch((err) => { $("#s2-status").innerHTML = esc(err.message); });
+  updateDMP();
   updateS1().catch((err) => { $("#s1-status").innerHTML = esc(err.message); });
 }
 
@@ -547,6 +548,8 @@ const WX_SERIES = [
   { key: "stations", label: "Météo-France stations (measured)", color: "#3d3d3a", product: "mf_stations" },
   { key: "comephore", label: "COMEPHORE", color: "#7b4fd6", product: "comephore" },
   { key: "mf_etp", label: "Météo-France ETP grid", color: "#1baf7a", dash: "2 3", product: "mf_etp" },
+  { key: "clms_ssm", label: "CLMS surface soil moisture", color: "#a0522d", product: "clms_ssm" },
+  { key: "clms_swi", label: "CLMS Soil Water Index", color: "#a0522d", dash: "4 2", product: "clms_swi" },
 ];
 // The stations a measured series was taken from: "ST OVIN 5.7 km (+2)", the details as a tooltip
 function stationsText(s) {
@@ -559,7 +562,7 @@ const WX_GROUPS = [
   ["Temperature", /^t_/], ["Precipitation and water", /^(precip|rain|snowfall|et0|evap|effective_rain|drainage|runoff)/],
   ["Radiation and energy", /^(radiation|longwave|sensible)/], ["Humidity", /^(rh_|vp|q_)/],
   ["Wind, clouds and boundary layer", /^(wind|gust|cloud|blh)/],
-  ["Snow", /^(snow_depth|swe)/], ["Soil", /^(soil_|swi|wg_)/],
+  ["Snow", /^(snow_depth|swe)/], ["Soil", /^(soil_|swi|wg_|ssm)/],
 ];
 const wx = { catalogue: null, lngLat: null, seq: 0 };
 // Swatch of a series: its colour, dashed like its line when it has a dash
@@ -1089,7 +1092,7 @@ async function updateS2() {
     s2.source = modis ? "modis" : "s2";
     setS2Years(modis ? s2.modis.years : s2.info.years);
     $("#s2-mask-label").textContent = modis ? "Hide unreliable cells (snow, ice, cloud)" : "Hide clouds, shadows and snow (SCL)";
-    $("#s2-weight-area").textContent = modis ? "By the group's share of each cell" : "By area (interior pixels)";
+    $("#s2-weight-area").textContent = modis ? "By the group's share of each cell" : "By area";
     $("#s2-weight-unit").textContent = modis ? "Each cell equally" : "One parcel, one vote";
     $("#s2-sources").innerHTML = modis ? s2.modisSources : s2.sources;
     s2.date = null;
@@ -1101,6 +1104,7 @@ async function updateS2() {
   $("#s2-group-row").hidden = view !== "crop";
   $("#s2-own-row").hidden = view !== "parcel";
   $("#s2-compare").innerHTML = "";
+  $("#s2-clms").innerHTML = "";
   $("#s2-history").innerHTML = "";
   if (view !== "parcel") removeS2Parcel();
   if (view === "crop") return updateS2Crop();
@@ -1326,8 +1330,8 @@ async function updateS2Crop() {
       ${refsFrom}${d.refs.lt ? ` (long term since ${d.refs.lt.seasons[0]})` : ""}.
       Crops: RPG parcels since ${Math.min(...c.rpg_years)}${c.ilot_years?.length ? `, RPG îlots ${c.ilot_years[0]}–${c.ilot_years[c.ilot_years.length - 1]} (an îlot counts for its majority group by the share it covers)` : ""}; before, permanent crops assumed.
       ${d.note ? `<br>${esc(d.note)}` : ""}`
-    : `<b>${esc(d.label)}</b> in <b>${esc(a.name)}</b>: ${d.weight === "pixels" ? "mean of the parcels' daily curves, weighted by their interior area" : "mean of the parcels' daily curves, one parcel one vote"}
-    (${how}) (each parcel's interior, clear on at least ${fmt(100 * d.min_clear)} % of it). ${refsFrom}.
+    : `<b>${esc(d.label)}</b> in <b>${esc(a.name)}</b>: ${d.weight === "pixels" ? "mean of the parcels' daily curves, weighted by their area" : "mean of the parcels' daily curves, one parcel one vote"}
+    (${how}) (each parcel without its 10 m border, clear on at least ${fmt(100 * d.min_clear)} % of it). ${refsFrom}.
     ${d.note ? `<br>${esc(d.note)}` : ""}`;
   s2.seasonData = { kind: "crop", unit, d, current: d.current?.mean, spread: d.current && [d.current.q25, d.current.q75],
     obs: d.observations.map((o) => ({ day: o.day, date: o.date, v: o.mean, used: true, n: o.parcels })),
@@ -1350,7 +1354,7 @@ async function updateS2Parcel(lngLat) {
   catch (e) {
     if (seq !== s2.seq) return;
     $("#s2-status").innerHTML = "No RPG parcel with clear observations at this point. Click another parcel.";
-    $("#s2-chart").innerHTML = ""; removeS2Parcel(); return;
+    $("#s2-chart").innerHTML = ""; $("#s2-clms").innerHTML = ""; removeS2Parcel(); return;
   }
   if (seq !== s2.seq) return;
   s2.season = d.season;
@@ -1374,6 +1378,96 @@ async function updateS2Parcel(lngLat) {
   showS2Parcel(d.geometry);
   renderSeason();
   renderHistory(d);
+  updateParcelCLMS(d);
+}
+
+// ---- Parcel view: soil moisture and dry matter productivity of the parcel (Copernicus, the cells
+// under the parcel weighted by its area in each)
+const SOIL_VARS = [["ssm", "Surface (Sentinel-1)", "#2a78d6"], ["swi002", "SWI T=2", "#e3b98c"], ["swi010", "SWI T=10", "#c98b55"],
+  ["swi020", "SWI T=20", "#a0522d"], ["swi040", "SWI T=40", "#76391b"], ["swi100", "SWI T=100", "#3f1d0c"]];
+const SOIL_NAMES = { ssm: "Surface soil moisture (Sentinel-1, top few cm)", swi002: "Soil Water Index T=2 (near the surface)",
+  swi010: "Soil Water Index T=10", swi020: "Soil Water Index T=20", swi040: "Soil Water Index T=40", swi100: "Soil Water Index T=100 (root zone)" };
+const yearSpan = (ys) => (ys.length ? `${Math.min(...ys)}–${Math.max(...ys)}` : "other years");
+const dayMonth = (iso) => (iso ? new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "2-digit" }) : "–");
+
+async function updateParcelCLMS(d) {
+  const seq = s2.seq, p = d.parcel;
+  s2.clms = null;
+  $("#s2-clms").innerHTML = "";
+  let c;
+  try { c = await api(`/api/clms/parcel?season=${d.season}&rpg_year=${p.rpg_year}&parcel_id=${encodeURIComponent(p.parcel_id)}`); }
+  catch (e) {
+    if (seq === s2.seq) $("#s2-clms").innerHTML = `<h2>Soil moisture and productivity</h2><p class="muted">${esc(e.message)}</p>`;
+    return;
+  }
+  if (seq !== s2.seq) return;
+  s2.clms = c;
+  renderParcelCLMS();
+}
+
+function renderParcelCLMS() {
+  const c = s2.clms;
+  if (!c) return;
+  const ref = $("#clms-ref")?.value || "swi040";
+  const cellText = (n, size) => `${n} cell${n > 1 ? "s" : ""} of ${size}`;
+  let html = "<h2>Soil moisture and productivity</h2>";
+  if (c.soil) {
+    const s = c.soil, times = s.times.map((t) => `${t}T00:00`);
+    const lines = SOIL_VARS.filter(([k]) => s.series[k] && k !== "ssm")
+      .map(([k, label, color]) => ({ label, color, values: s.series[k].values }));
+    if (s.series.ssm) lines.push({ label: "Surface (Sentinel-1)", color: "#2a78d6", values: s.series.ssm.values, dots: true });
+    if (s.series[ref]) lines.push({ label: `${SOIL_VARS.find(([k]) => k === ref)[1]}, mean ${yearSpan(s.stats[ref].reference_years)}`,
+      color: "#8a8a86", dash: "4 3", values: s.series[ref].reference });
+    html += `<label class="row">Compare with the other years <select id="clms-ref">${SOIL_VARS.filter(([k]) => s.series[k])
+        .map(([k, label]) => `<option value="${k}"${k === ref ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
+      + timeChart({ times, leftUnit: "%", lines,
+        label: `Soil moisture of the parcel, % of saturation (Copernicus, ${cellText(s.cells, "1 km")}), to ${dayMonth(s.last)}` });
+  }
+  if (c.dmp) {
+    const m = c.dmp, times = m.times.map((t) => `${t}T00:00`), ys = yearSpan(m.reference_years);
+    html += timeChart({ times, leftUnit: "kg/ha/d", label: `Dry matter productivity of the parcel, kg per hectare and day (Copernicus, ${cellText(m.cells, "300 m")}), to ${dayMonth(m.last)}`,
+        lines: [{ label: `${c.season}`, color: "#1baf7a", values: m.values },
+                { label: `Mean ${ys}`, color: "#8a8a86", values: m.reference.mean },
+                { label: "Lowest / highest", color: "#c9c9c4", dash: "2 3", values: m.reference.min },
+                { label: "", color: "#c9c9c4", dash: "2 3", values: m.reference.max }] })
+      + timeChart({ times, leftUnit: "t/ha", label: `Dry matter produced since ${dayMonth(c.start)} (t/ha)`,
+        lines: [{ label: `${c.season}`, color: "#1baf7a", values: m.cumulative },
+                { label: `Mean ${ys}`, color: "#8a8a86", values: m.cumulative_reference }] });
+  }
+  const row = (name, title, st, unit, digits = 1) => `<tr><td title="${esc(title)}" style="white-space:nowrap">${esc(name)}</td><td class="num"><b>${fmt(st.mean, digits)}</b></td>
+    <td class="num">${fmt(st.reference, digits)}</td><td class="num">${st.difference === null ? "–" : `${st.difference > 0 ? "+" : ""}${fmt(st.difference, digits)}`}</td>
+    <td class="num">${fmt(st.min, digits)}<br><span class="muted" style="font-size:10px">${dayMonth(st.min_date)}</span></td>
+    <td class="num">${fmt(st.max, digits)}<br><span class="muted" style="font-size:10px">${dayMonth(st.max_date)}</span></td><td class="muted">${unit}</td></tr>`;
+  const rows = [];
+  if (c.soil) for (const [k, label] of SOIL_VARS) if (c.soil.stats[k]) rows.push(row(label, SOIL_NAMES[k], c.soil.stats[k], "%"));
+  if (c.dmp) {
+    const st = c.dmp.stats;
+    rows.push(row("DMP", "Dry matter productivity, mean", st, "kg/ha/d"));
+    rows.push(`<tr><td title="Dry matter produced over the period" style="white-space:nowrap">Dry matter</td><td class="num"><b>${fmt(st.total, 1)}</b></td><td class="num">${fmt(st.reference_total, 1)}</td>
+      <td class="num">${st.difference_pct === null ? "–" : `${st.difference_pct > 0 ? "+" : ""}${fmt(st.difference_pct)} %`}</td><td></td><td></td><td class="muted">t/ha</td></tr>`);
+  }
+  const csv = `/api/clms/parcels.csv?season=${c.season}&site=${encodeURIComponent(aoiInfo.code)}`;
+  html += `<div class="table-wrap"><table class="kv"><tr><th></th><th class="num">${c.season}</th><th class="num">Other years</th>
+      <th class="num">Diff.</th><th class="num">Lowest</th><th class="num">Highest</th><th></th></tr>${rows.join("")}</table></div>
+    <div class="muted" style="font-size:11px">Means over the season from ${dayMonth(c.start)} to the last published date; other years: the
+      same period of each year of the record, to the same date. The parcel's value is the mean of the cells it overlaps, weighted by
+      its area in each: the cells (1 km, 300 m) are larger than most parcels, so they tell the soil water and growth of its surroundings
+      (compare seasons, and distant parcels, rather than neighbours). Soil moisture in % of saturation: the surface from the Sentinel-1
+      radar on the days of a pass, the Soil Water Index from the surface (T=2) to the root zone (T=100).
+      <a href="${csv}" download>Statistics of every parcel of the season ${c.season} (CSV)</a>.</div>`;
+  $("#s2-clms").innerHTML = html;
+  $("#clms-ref")?.addEventListener("change", renderParcelCLMS);
+}
+
+// The Copernicus HR-VPP season of a parcel (start, peak, end from the Plant Phenology Index), in words
+function vppText(sd) {
+  const v = sd.d.vpp;
+  if (sd.kind !== "parcel" || !v) return "";
+  const day = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) : "–";
+  return `<div class="muted" style="font-size:11px;margin-top:4px"><span style="color:#7b4fd6">▮</span>
+    Copernicus HR-VPP season (Plant Phenology Index, 10 m): start ${day(v.sos)}, peak ${day(v.peak)}, end ${day(v.eos)}
+    (${fmt(v.length_days)} days); PPI peak ${fmt(v.ppi_max, 2)}, amplitude ${fmt(v.ppi_amplitude, 2)}, season productivity ${fmt(v.season_productivity, 0)}.
+    Median of ${v.n_pixels} pixels (${v.n_dated} with dates).</div>`;
 }
 
 function seasonChart(sd) {
@@ -1420,6 +1514,9 @@ function seasonChart(sd) {
     ${sd.obs.map((o) => o.used
       ? `<circle cx="${sx(o.day).toFixed(1)}" cy="${sy(o.v).toFixed(1)}" r="3.5" fill="#2a78d6" stroke="#fff" stroke-width="1.5"/>`
       : `<circle cx="${sx(o.day).toFixed(1)}" cy="${sy(o.v).toFixed(1)}" r="3" fill="#fff" stroke="#8a8a86" stroke-width="1.2"/>`).join("")}
+    ${sd.kind === "parcel" && d.vpp ? [["sos_day", "start"], ["peak_day", "peak"], ["eos_day", "end"]]
+      .filter(([k]) => d.vpp[k] !== null && d.vpp[k] >= 0 && d.vpp[k] < d.days).map(([k, label]) => `<line x1="${sx(d.vpp[k])}" x2="${sx(d.vpp[k])}"
+        y1="${SN_M.t}" y2="${SN_H - SN_M.b}" stroke="#7b4fd6" stroke-dasharray="4 3"/><text x="${sx(d.vpp[k]) + 2}" y="${SN_M.t + 8}" fill="#7b4fd6" font-size="9">${label}</text>`).join("") : ""}
     <line class="wx-cross" y1="${SN_M.t}" y2="${SN_H - SN_M.b}" stroke="#8a8a86" visibility="hidden"/>
     <g class="wx-dots"></g>
     <rect class="wx-hit" x="${SN_M.l}" y="0" width="${SN_W - SN_M.l - SN_M.r}" height="${SN_H}" fill="transparent" style="cursor:pointer"/>
@@ -1451,7 +1548,7 @@ function bindSeasonHover() {
 
 function renderSeason() {
   const sd = s2.seasonData;
-  $("#s2-chart").innerHTML = seasonChart(sd);
+  $("#s2-chart").innerHTML = seasonChart(sd) + vppText(sd);
   bindSeasonHover();
   // Comparison: on the latest observation (season in progress), at the peak (1 Jan - 31 Aug) and
   // averaged from 1 January (to the latest observation, or over the year when the season is over)
@@ -2232,20 +2329,28 @@ function timeChart({ times, lines = [], bars = null, leftUnit = "", rightUnit = 
   const sy = (v) => TC_H - TC_M.b - ((v - lt[0]) / (lt[lt.length - 1] - lt[0] || 1)) * (TC_H - TC_M.t - TC_M.b);
   const sb = (v) => TC_H - TC_M.b - (v / bmax) * (TC_H - TC_M.t - TC_M.b);
   const bw = Math.max(1.5, (TC_W - TC_M.l - TC_M.r) / times.length - 1);
+  // ticks: each midnight over a few days, the first of each month over longer spans
+  const monthly = x1 - x0 > 21 * 86400e3;
   const days = [];
-  for (let d = new Date(x0); d.getTime() <= x1; d.setHours(24, 0, 0, 0)) if (d.getTime() > x0) days.push(d.getTime());
+  for (let d = new Date(x0); d.getTime() <= x1; monthly ? d.setMonth(d.getMonth() + 1, 1) : d.setHours(24, 0, 0, 0)) {
+    if (monthly) d.setHours(0, 0, 0, 0);
+    if (d.getTime() > x0) days.push(d.getTime());
+  }
+  const tick = monthly ? { month: "short" } : { weekday: "short", day: "numeric" };
 
-  return `${label ? `<div class="muted">${label}</div>` : ""}<div class="wx-legend">${lines.map((l) =>
-      `<span class="k"><span class="line" style="background:${l.color}"></span>${esc(l.label)}</span>`).join("")}
+  return `${label ? `<div class="muted">${label}</div>` : ""}<div class="wx-legend">${lines.filter((l) => l.label).map((l) =>
+      `<span class="k"><span class="${l.dots ? "dot" : "line"}" style="background:${l.color}"></span>${esc(l.label)}</span>`).join("")}
     ${bars ? `<span class="k"><span class="line" style="background:${bars.color};height:8px"></span>${esc(bars.label)}</span>` : ""}</div>
     <div class="wx-plot"><svg viewBox="0 0 ${TC_W} ${TC_H}" role="img" aria-label="${esc(label || "Chart")}">
     ${yGrid(lt, sy, TC_M, TC_W)}
     ${bars ? [0, bmax / 2, bmax].map((v) => `<text x="${TC_W - TC_M.r + 3}" y="${sb(v) + 3}" fill="${bars.color}">${fmt(v, bmax < 5 ? 1 : 0)}</text>`).join("") : ""}
     ${days.map((ms) => `<line x1="${sx(ms)}" x2="${sx(ms)}" y1="${TC_M.t}" y2="${TC_H - TC_M.b}" stroke="#c9c9c4" stroke-dasharray="2 3"/>
-      <text x="${sx(ms) + 3}" y="${TC_H - 6}">${new Date(ms).toLocaleDateString(undefined, { weekday: "short", day: "numeric" })}</text>`).join("")}
+      <text x="${sx(ms) + 3}" y="${TC_H - 6}">${new Date(ms).toLocaleDateString(undefined, tick)}</text>`).join("")}
     ${bars ? bars.values.map((v, i) => v ? `<rect x="${(sx(t[i]) - bw).toFixed(1)}" y="${sb(v).toFixed(1)}" width="${bw.toFixed(1)}" height="${(sb(0) - sb(v)).toFixed(1)}"
       fill="${bars.color}" opacity="0.8"><title>${esc(localTime(times[i]))}: ${fmt(v, 1)} ${esc(rightUnit)}</title></rect>` : "").join("") : ""}
-    ${lines.map((l) => `<path d="${svgPath(l.values, (i) => sx(t[i]), sy)}" fill="none" stroke="${l.color}" stroke-width="2" ${l.dash ? `stroke-dasharray="${l.dash}"` : ""}/>`).join("")}
+    ${lines.map((l) => l.dots
+      ? l.values.map((v, i) => v === null ? "" : `<circle cx="${sx(t[i]).toFixed(1)}" cy="${sy(v).toFixed(1)}" r="1.6" fill="${l.color}"/>`).join("")
+      : `<path d="${svgPath(l.values, (i) => sx(t[i]), sy)}" fill="none" stroke="${l.color}" stroke-width="2" ${l.dash ? `stroke-dasharray="${l.dash}"` : ""}/>`).join("")}
     <text x="${TC_M.l}" y="${TC_M.t + 2}" font-size="9" fill="#6a737d">${esc(leftUnit)}</text>
   </svg></div>`;
 }
@@ -2364,6 +2469,42 @@ async function updateSea() {
       <td>${arrow(s.waves.dir[i])}</td></tr>`).join("")}</table>
     <div class="muted" style="font-size:11px">The surge is the anomaly due to wind and pressure, to add to the tide (not provided).</div>`;
 }
+
+// ---------------------------------------------------------------------------
+// Vegetation tab: dry matter productivity (Copernicus, 300 m, every 10 days)
+// ---------------------------------------------------------------------------
+const dmp = { seq: 0 };
+async function updateDMP() {
+  const seq = ++dmp.seq;
+  if (!currentArea) return;
+  let d;
+  try {
+    const y = $("#dmp-year").value;
+    d = await api(`/api/clms/dmp?area=${encodeURIComponent(currentArea)}${y ? `&year=${y}` : ""}`);
+  } catch (e) { $("#dmp-chart").innerHTML = `<p class="muted">${esc(e.message)}</p>`; return; }
+  if (seq !== dmp.seq) return;
+  const keep = d.year;
+  $("#dmp-year").innerHTML = [...d.years].reverse().map((y) => `<option value="${y}">${y}</option>`).join("");
+  $("#dmp-year").value = keep;
+  const times = d.dekads.map((md) => `${d.year}-${md}T00:00`);
+  const ry = d.reference_years;
+  const refLabel = ry.length ? `${ry[0]}–${ry[ry.length - 1]}` : "other years";
+  const cur = d.cumulative.filter((v) => v !== null);
+  $("#dmp-chart").innerHTML = timeChart({ times, leftUnit: "kg/ha/d", label: `Biomass growth every 10 days, kg of dry matter per hectare and day (mean of ${d.cells} cell${d.cells > 1 ? "s" : ""} of 300 m)`,
+      lines: [{ label: `${d.year}`, color: "#1baf7a", values: d.values },
+              { label: `Mean ${refLabel}`, color: "#8a8a86", values: d.reference.mean },
+              { label: "Lowest / highest", color: "#c9c9c4", dash: "2 3", values: d.reference.min },
+              { label: "", color: "#c9c9c4", dash: "2 3", values: d.reference.max }] })
+    + timeChart({ times, leftUnit: "t/ha", label: "Dry matter produced since 1 January (t/ha)",
+      lines: [{ label: `${d.year}`, color: "#1baf7a", values: d.cumulative },
+              { label: `Mean ${refLabel}`, color: "#8a8a86", values: d.cumulative_reference.mean },
+              { label: "Lowest / highest", color: "#c9c9c4", dash: "2 3", values: d.cumulative_reference.min },
+              { label: "", color: "#c9c9c4", dash: "2 3", values: d.cumulative_reference.max }] })
+    + `<div class="muted" style="font-size:11px">${cur.length ? `${d.year}: ${fmt(cur[cur.length - 1], 1)} t/ha so far. ` : ""}
+       Dry matter productivity (DMP), Copernicus Land Monitoring Service, 300 m: an estimate of the vegetation's growth from its
+       absorbed light (all vegetation of the cells, not one crop); compare years and areas rather than reading it as a yield.</div>`;
+}
+$("#dmp-year").addEventListener("change", updateDMP);
 
 // ---------------------------------------------------------------------------
 // Data tab: how each dataset is followed for this site, and actions

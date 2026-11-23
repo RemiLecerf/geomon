@@ -307,59 +307,12 @@ CREATE TABLE IF NOT EXISTS eo.index_stats (
     PRIMARY KEY (site, area, index, date)
 );
 
--- Sites as small integers in the largest tables (a site's name repeated in every row and in the key
--- took 17 % of eo.parcel_stats). meta.site_id gives a site its id (adding it), meta.site_key_of only
--- reads it (stable: computed once per query, the primary key usable).
-CREATE TABLE IF NOT EXISTS meta.site_key (
-    id    smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    site  text NOT NULL UNIQUE
-);
-CREATE OR REPLACE FUNCTION meta.site_id(s text) RETURNS smallint LANGUAGE sql AS $$
-    WITH added AS (INSERT INTO meta.site_key (site) VALUES (s) ON CONFLICT (site) DO NOTHING RETURNING id)
-    SELECT id FROM added UNION ALL SELECT id FROM meta.site_key WHERE site = s LIMIT 1
-$$;
-CREATE OR REPLACE FUNCTION meta.site_key_of(s text) RETURNS smallint LANGUAGE sql STABLE AS $$
-    SELECT id FROM meta.site_key WHERE site = s
-$$;
-
--- An eo.parcel_stats keyed by the site's name (before version 10): moved to the site key
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM information_schema.columns
-               WHERE table_schema = 'eo' AND table_name = 'parcel_stats' AND column_name = 'site') THEN
-        INSERT INTO meta.site_key (site) SELECT DISTINCT site FROM eo.parcel_stats ON CONFLICT DO NOTHING;
-        CREATE TABLE eo.parcel_stats_v10 (
-            site_id smallint NOT NULL, rpg_year int NOT NULL, parcel_id text NOT NULL, index text NOT NULL,
-            date date NOT NULL, mean real, std real, n_pixels int, n_clear int);
-        INSERT INTO eo.parcel_stats_v10
-            SELECT k.id, p.rpg_year, p.parcel_id, p.index, p.date, p.mean, p.std, p.n_pixels, p.n_clear
-            FROM eo.parcel_stats p JOIN meta.site_key k ON k.site = p.site;
-        DROP TABLE eo.parcel_stats;
-        ALTER TABLE eo.parcel_stats_v10 RENAME TO parcel_stats;
-        ALTER TABLE eo.parcel_stats ADD PRIMARY KEY (site_id, rpg_year, index, parcel_id, date);
-        ANALYZE eo.parcel_stats;
-    END IF;
-END $$;
-
--- Per-date index statistics over each RPG parcel's interior (see geomon.parcels)
-CREATE TABLE IF NOT EXISTS eo.parcel_stats (
-    site_id    smallint NOT NULL,      -- meta.site_key
-    rpg_year   int  NOT NULL,          -- RPG year of the parcel outline
-    parcel_id  text NOT NULL,          -- RPG id_parcel (unique within a year only)
-    index      text NOT NULL,
-    date       date NOT NULL,
-    mean       real,
-    std        real,
-    n_pixels   int,                    -- interior pixels (outline shrunk by 10 m)
-    n_clear    int,                    -- clear interior pixels with a valid index
-    PRIMARY KEY (site_id, rpg_year, index, parcel_id, date)
-);
-
--- Parcel-dates processed (also when no parcel was clear)
-CREATE TABLE IF NOT EXISTS eo.parcel_dates (
-    site text NOT NULL, rpg_year int NOT NULL, index text NOT NULL, date date NOT NULL,
-    PRIMARY KEY (site, rpg_year, index, date)
-);
+-- The per-date statistics of the parcels moved to Zarr stores (version 12, geomon.fields): their
+-- tables and the site keys that only they used are dropped
+DROP TABLE IF EXISTS eo.parcel_stats, eo.parcel_dates;
+DROP FUNCTION IF EXISTS meta.site_key_of(text);
+DROP FUNCTION IF EXISTS meta.site_id(text);
+DROP TABLE IF EXISTS meta.site_key;
 
 -- Daily curve of each parcel and season
 CREATE TABLE IF NOT EXISTS eo.parcel_season (
@@ -434,3 +387,24 @@ CREATE TABLE IF NOT EXISTS eo.group_season (
 -- ---------------------------------------------------------------------------
 -- version 3: the raster catalogue, written by the ingestion but read by nothing
 DROP TABLE IF EXISTS meta.raster_dataset;
+
+-- Copernicus HR-VPP (vegetation phenology and productivity, 10 m, yearly) per parcel: the medians of
+-- its interior pixels (see geomon.clms); dates where enough pixels could be decoded
+CREATE TABLE IF NOT EXISTS eo.parcel_vpp (
+    site                 text NOT NULL,
+    year                 int  NOT NULL,          -- the season's year (its peak)
+    rpg_year             int  NOT NULL,          -- RPG outlines used (0: the farm's fields)
+    parcel_id            text NOT NULL,
+    sos                  date,                   -- start of season
+    peak                 date,
+    eos                  date,                   -- end of season
+    length_days          real,
+    ppi_max              real,                   -- Plant Phenology Index at the peak
+    ppi_amplitude        real,
+    season_productivity  real,                   -- sum of daily PPI over the season, above its base
+    total_productivity   real,                   -- sum of daily PPI over the season
+    qflag                real,
+    n_pixels             int,
+    n_dated              int,
+    PRIMARY KEY (site, year, rpg_year, parcel_id)
+);

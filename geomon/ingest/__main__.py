@@ -19,13 +19,14 @@ from ..aoi import resolve_aoi, save_aoi
 from ..config import all_sites, settings, use_site
 from ..db import connect
 from .lock import ingest_lock, lock_group
-from . import (admin, agera5, alerts, comephore, dem, era5, farm, groundwater, insee, mf_etp, mf_models, mf_obs, mf_stations, modis, nowcast, openmeteo,
+from . import (admin, agera5, alerts, clms, comephore, dem, era5, farm, groundwater, insee, mf_etp, mf_models, mf_obs, mf_stations, modis, nowcast, openmeteo,
                osm, radar, rpg, sentinel1, sentinel2, sim2, soil, soil_inrae, soil_maps)
 
 STEPS = {
     "admin": admin.run,
     "farm": farm.run,                   # the farm's plots (GEOMON_FARM_FILE) as an analysis area
-    "rpg": rpg.run,
+    "rpg": rpg.run,                       # every RPG year again (a correction of the published RPG)
+    "rpg-new": rpg.run_new,               # the RPG years newly published, then the seasons recomputed
     "osm": osm.run,
     "dem": dem.run,
     "soil": soil.run,
@@ -62,6 +63,9 @@ STEPS = {
     "arome": mf_models.run_arome,       # AROME 1.3 km maps, 51 hours (key)
     "pe-arome": mf_models.run_pearome,  # PE-AROME ensemble probabilities of rain and frost (key)
     "sea": mf_models.run_sea,           # waves (MFWAM) and storm surge (HYCOM2D), coastal sites (key)
+    "clms-soil": clms.run_soil,         # soil moisture: Sentinel-1 SSM and the Soil Water Index, 1 km (openEO)
+    "clms-dmp": clms.run_dmp,           # dry matter productivity, 300 m, 10-daily (openEO)
+    "clms-vpp": clms.run_vpp,           # HR-VPP phenology and productivity per parcel, yearly (openEO)
     "forecast": openmeteo.run_forecast, # latest forecast (run it daily)
 }
 

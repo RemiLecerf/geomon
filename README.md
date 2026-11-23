@@ -7,7 +7,7 @@ web map. See [Specifications.md](Specifications.md) for the full project.
 | Data | Source | Storage |
 |---|---|---|
 | Administrative hierarchy: commune (+ neighbours), EPCI, arrondissement, département, région, France | IGN ADMIN EXPRESS COG 2026 (Géoplateforme WFS) | PostGIS `ref.admin_unit`, with validity dates |
-| Agricultural parcels, RPG 2015–2025 (every year: crop history of each parcel) | IGN Géoplateforme WFS (`RPG.LATEST` for the latest year, checked at download; `RPG.<year>` before) | PostGIS `ref.rpg_parcel`, `ref.rpg_crop_code` |
+| Agricultural parcels, RPG 2015 to the latest published (every year: crop history of each parcel; a new year loaded within a week of its publication) | IGN Géoplateforme WFS (`RPG.<year>`, and `RPG.LATEST` for the latest year until it has its own layer) | PostGIS `ref.rpg_parcel`, `ref.rpg_crop_code` |
 | Farm îlots, RPG 1.0 2007–2014 (blocks of parcels of one farm, with their majority crop group only) | 2010–2014: IGN WFS `RPG.<year>:rpg_<year>`; 2007–2009: IGN download service, regional 7z archives (105 MB for Normandie, 285 MB for Auvergne-Rhône-Alpes per year), deleted once loaded | PostGIS `ref.rpg_ilot` |
 | OpenStreetMap: roads, buildings, land use, water, waterways, railways, POIs | Overpass API, one query over the AOI extent (Geofabrik extracts optional, for later) | PostGIS `ref.osm_feature`. Raw response kept in `data/raw/osm` |
 | Elevation model, 5 m, plus slope and aspect | IGN RGE ALTI (Géoplateforme WMS-R) | Zarr `data/zarr/sites/<site>/dem.zarr`, overviews `dem_ov4`, `dem_ov16`, `dem_ov64`: scaled integers (elevation to the cm, slope and aspect to 0.01°, byte-shuffled zstd), 60 % smaller than float32 |
@@ -16,13 +16,16 @@ web map. See [Specifications.md](Specifications.md) for the full project.
 | Dominant soils (RRP 1:250 000), geology 1:50 000, clay shrink-swell exposure | IGN WFS `INRAE_CARTE-SOLS` (Gis Sol); BRGM BD Charm-50 (InfoTerre) and `ALEARG` WFS | PostGIS `ref.soil_feature` |
 | Groundwater levels (nearest piezometers) | Hub'Eau API "niveaux des nappes" (ADES) | PostGIS `ref.gw_station`, `eo.gw_level` |
 | Derived soil hydraulics: water content at field capacity, wilting point and saturation, saturated conductivity (Ksat), available water capacity (AWC), USDA texture class | Saxton & Rawls (2006) pedotransfer functions | Zarr `data/zarr/soil.zarr` |
-| Satellite, Sentinel-2 L2A (Sen2Cor atmospheric correction), since 2015-06-27, 10 m: bands B04 and B08 (NDVI) plus the scene classification (SCL); more bands on demand (B05 for NDRE, …) | Copernicus Data Space, through openEO (free account) | Zarr `data/zarr/sentinel2/<site>/<year>.zarr`; per-date index statistics per area in `eo.index_stats`, per RPG parcel in `eo.parcel_stats`, smoothed parcel-season curves in `eo.parcel_season` |
+| Satellite, Sentinel-2 L2A (Sen2Cor atmospheric correction), since 2015-06-27, 10 m: bands B04 and B08 (NDVI) plus the scene classification (SCL); more bands on demand (B05 for NDRE, …) | Copernicus Data Space, through openEO (free account) | Zarr `data/zarr/sentinel2/<site>/<year>.zarr`; per-date index statistics per area in `eo.index_stats`, per RPG parcel (and farm field) in Zarr `data/zarr/sites/<site>/fields/sentinel2/<layer>.zarr` (see *Field-level aggregation*), smoothed parcel-season curves in `eo.parcel_season` |
 | Weather, hourly: Météo-France AROME/ARPEGE archived forecasts (from 2022-11-13) and the latest forecast (AROME/ARPEGE to ~4 days, then ECMWF IFS to 15 days) | Open-Meteo (free, non-commercial use) | Zarr `data/zarr/weather/om_mf_hist.zarr`, `om_forecast.zarr` |
 | Reanalysis, hourly: ERA5-Land 0.1° (core weather, snow, soil temperature and moisture in 4 layers) | Copernicus CDS, `reanalysis-era5-land-timeseries` (free account, CC-BY 4.0); Open-Meteo as an option | Zarr `data/zarr/sites/<site>/weather/era5land.zarr` |
 | Reanalysis, hourly: ERA5 0.25° (core weather, plus cloud cover, boundary-layer height, gusts, 100 m wind, surface heat fluxes and the actual evapotranspiration derived from them) | Copernicus CDS, `reanalysis-era5-single-levels-timeseries` | Zarr `data/zarr/sites/<site>/weather/era5.zarr` |
 | Agrometeorological indicators, daily, since 1979: AgERA5, 0.1° (ERA5 aggregated to local days and corrected to the 0.1° topography), about 10 days behind | Copernicus CDS (free account, CC-BY 4.0) | Zarr `data/zarr/weather/agera5.zarr`. Download of the AOI box in `data/raw/agera5` |
 | Reanalysis, daily: SAFRAN-ISBA (SIM2), 8 km, since 1990 (for the 1991–2020 normals), with ETP, soil wetness index, drainage, snow | Météo-France open data (meteo.data.gouv.fr) | Zarr `data/zarr/weather/sim2.zarr`. Only the AOI cells are kept, in `data/raw/sim2` |
 | Measured daily weather of the Météo-France stations within 40 km (up to 8, still measuring): rain, temperature, wind, gusts, humidity, and where measured radiation, ETP and snow depth, since 1990 | Météo-France "Données climatologiques de base - quotidiennes" (meteo.data.gouv.fr, Licence Ouverte, no account) | Zarr `data/zarr/sites/<site>/weather/mf_stations.zarr`; département files in `data/raw/mf_stations` |
+| Soil moisture, 1 km, daily: surface soil moisture from Sentinel-1 (since October 2014) and the Soil Water Index at five depths (T = 2, 10, 20, 40, 100: from the surface to the root zone; version 1 to July 2025, then version 2), in % of saturation | Copernicus Land Monitoring Service through openEO on the Copernicus Data Space (the Sentinel-2 login) | Zarr `data/zarr/sites/<site>/weather/clms_ssm.zarr`, `clms_swi.zarr` (one point per 1/112° cell) |
+| Dry matter productivity (DMP, kg DM/ha/day), 300 m, every 10 days, since 2014 | Copernicus Land Monitoring Service (openEO, CDSE) | Zarr `data/zarr/sites/<site>/dmp.zarr` |
+| Vegetation phenology and productivity (HR-VPP), 10 m, yearly since 2017: start, peak, end and length of the season, peak and amplitude of the Plant Phenology Index, productivity | Copernicus Land Monitoring Service (openEO, CDSE) | PostGIS `eo.parcel_vpp` (per parcel; the rasters are not kept) |
 | Rainfall reanalysis COMEPHORE: hourly, 1 km, radar merged with rain gauges, since 1997, about two months behind (kept as daily sums over UTC days) | Météo-France "Réanalyses Coméphore" (meteo.data.gouv.fr, Licence Ouverte, no account) | Zarr `data/zarr/sites/<site>/weather/comephore.zarr`: every day since `GEOMON_COMEPHORE_START`, each month written in its place as it is read, for every site lacking it (one stream per month for all the sites). The monthly archives (50–250 MB) are streamed, never stored |
 | Daily Penman-Monteith ETP, 0.125° grid, since 1970 | Météo-France "Données ETP spatialisées quotidiennes" (meteo.data.gouv.fr, Licence Ouverte) | Zarr `data/zarr/sites/<site>/weather/mf_etp.zarr`; yearly files in `data/raw/mf_etp` |
 | Observations of the last days, hourly, at the stations within 40 km | Météo-France API "Paquet Observation" (key) | Zarr `data/zarr/sites/<site>/weather/mf_obs.zarr` (live: last 120 hours) |
@@ -309,13 +312,35 @@ docker compose run --rm ingest sentinel2           # history since 2015 (a few b
 - openEO batch jobs use credits of the Copernicus Data Space free monthly allowance; an AOI of a few
   communes needs few.
 
+#### Field-level aggregation
+
+Rasters are aggregated per field by one method (`geomon/zonal.py`), whatever their resolution against the
+fields': the share of each grid cell inside each field, computed exactly (shapely/GEOS: cells wholly
+inside count 1, those the outline crosses for their part inside) once per grid and field layer, and cached
+(`data/cache/coverage`). A field over many small cells (Sentinel-2, 10 m) takes them all, its border
+pixels in part; a field smaller than a cell (250 m, 1 km) takes the cell or cells under it, weighted by
+the share of the field each holds. Every date is then aggregated for all the fields at once (sparse matrix
+products, about 7 ms per Sentinel-2 date for 2,500 parcels); cells without a value (clouds, the sea) are
+left out and give the share of the field with a value. A site in several parts adds its parts' sums.
+
+Compared before choosing (2,465 parcels at Dragey): the former method (pixel centres in the shrunk
+outline) left 22 % of the parcels without any value (small or narrow ones); exactextract gives the same
+shares (to 5·10⁻⁸) but its build for Python 3.14 crashes on some RPG outlines; xvec relies on it (or on
+pixel centres); a geopandas overlay of the cells is exact but impractical at 10 m. The results are kept
+per site, product and layer in Zarr (`geomon/fields.py`: mean, standard deviation and valid share per
+date and field; about 1 MB for a season of 2,500 parcels, against about 13 MB as database rows).
+Sentinel-2 uses it first; the other rasters follow.
+
 #### Parcels and crop groups
 
 Index series are also kept per RPG parcel, which removes the mixing of land covers of the area means:
 
-1. **Parcel-date statistics** (`eo.parcel_stats`, the full history): for every stored date, the mean and
-   standard deviation of each index over the parcel's interior (outline shrunk by 10 m, so that pixels
-   shared with a hedge, a road or the next field are left out), clear pixels only. Each season uses the
+1. **Parcel-date statistics** (the full history, one Zarr store per RPG year and one for the farm's
+   fields: `data/zarr/sites/<site>/fields/sentinel2/rpg<year>.zarr`, `farm.zarr`): for every stored date,
+   the mean and standard deviation of each index over the parcel and the share of its area that is clear,
+   by the field-level aggregation below: each pixel counts for its share inside the parcel's outline
+   shrunk by 10 m (pixels shared with a hedge, a road or the next field are left out), or inside its
+   whole outline when less than 4 pixels' area (400 m²) would remain once shrunk. Each season uses the
    parcels of its own RPG year: outlines and identifiers change every year.
 2. **Parcel-season curves** (`eo.parcel_season`): a daily curve per parcel and season, from the dates on
    which at least `GEOMON_S2_PARCEL_MIN_CLEAR` (80 %) of the parcel is clear. By default
@@ -325,23 +350,32 @@ Index series are also kept per RPG parcel, which removes the mixing of land cove
    weight (residual cloud, haze and shadow lower the index), so the curve follows the upper envelope.
    Gaps of more than 60 days stay empty. The season peak (1 January–31 August) and its date are stored
    too. After changing the method, run `ingest sentinel2-parcels`.
-3. **References** (computed on request): the curve of a crop group in an area is the mean, day by day, weighted by each parcel's interior pixels
-   (the area measured; "one parcel, one vote" can be chosen in the view),
+3. **References** (computed on request): the curve of a crop group in an area is the mean, day by day, weighted by each parcel's area followed
+   (in pixels; "one parcel, one vote" can be chosen in the view),
    of its parcels' curves; the 3-year, 5-year and long-term references are the means of the group curves
    of the seasons before the one compared, and the long-term 10th–90th percentile of these seasons gives
    the normal range.
 
 A **season** Y is the crop of RPG year Y, followed from 1 September Y-1 (autumn sowing) to 31 December Y
 (last harvests); a date of September to December belongs to two seasons. The RPG of the current year is
-published about a year later: until then the latest RPG outlines are used, with its crop for permanent
-crops only (permanent grassland, moorland, orchards, vines, nut trees, olive groves). Other parcels can
-still be followed one by one, against the references of their last known crop.
+published about a year later: until then the latest RPG outlines are used (in November 2026, the 2025 outlines
+for the seasons 2026 and 2027), with its crop for permanent crops only (permanent grassland, moorland, orchards,
+vines, nut trees, olive groves). Other parcels can still be followed one by one, against the references of their
+last known crop.
+
+The scheduler checks the IGN every week (dataset `rpg`, step `rpg-new`). When a new year is published, it is
+loaded and everything that used other outlines in its place is recomputed for each site: the seasons concerned
+(its own season, and the next one) get their parcel statistics with the new outlines (from the stored images, no
+download), their curves and crop-group curves; the statistics of the old outlines that no season uses any more
+are removed; the MODIS crop-group curves of those seasons are recomputed, and their HR-VPP rows read again by the
+next `clms-vpp` run. `GEOMON_RPG_YEAR` (unset by default) stops the RPG at a year.
 
 In the **one parcel** view, the crop history goes back to 2007: before 2015 it gives the majority crop
 group of the farm îlot at the point (and its share of the îlot from 2010).
 
-The parcel series are updated by every `sentinel2` run. After loading RPG years (`ingest rpg`, every
-year since `GEOMON_RPG_FIRST_YEAR=2015`), recompute them without downloading anything (about 2 minutes):
+The parcel series are updated by every `sentinel2` run. After reloading every RPG year (`ingest rpg`, every
+year since `GEOMON_RPG_FIRST_YEAR=2015`: a correction of the published RPG), recompute them without downloading
+anything (about 2 minutes):
 
 ```bash
 docker compose run --rm ingest sentinel2-parcels
@@ -374,6 +408,50 @@ docker compose run --rm ingest sentinel1-stats    # recompute the statistics fro
   `sentinel-1-slc` and `sentinel-1-slc-burst`; openEO has neither them nor a coherence process: it would
   be a separate, local processing chain.
 - The scheduler checks the STAC catalogue every 3 hours and updates a site when a new acquisition covers it.
+
+### Copernicus Land Monitoring Service: soil moisture, productivity, phenology
+
+Three products of the Copernicus Land Monitoring Service, read through openEO on the Copernicus Data Space
+with the Sentinel-2 login (they cost credits as Sentinel-2 does, far fewer: coarse grids or one image a year).
+Each step reads only what is missing since the end of its store; the record is read four years per batch job,
+the updates by small synchronous requests. Soil moisture is published on the Data Space a day or two after its
+date, productivity three to five weeks after its 10 days start, phenology the following year; the Data Space's
+feed can also stop for weeks (from 17 September to at least 21 November 2026 for both). So each step first asks,
+for free, what is published (the Data Space's STAC catalogue; for HR-VPP, the openEO collection's extent) and runs
+no openEO request while nothing is newer than its store. The Data tab lists them (`clms_soil`, `clms_dmp`, `clms_vpp`).
+
+- **Soil moisture** (step `clms-soil`, daily at 09:00 UTC): two Weather tab sources, *CLMS surface soil
+  moisture* (Sentinel-1, the top few centimetres, values on the days of a pass) and *CLMS Soil Water Index*
+  (moisture at five depths of infiltration, from T=2, near the surface, to T=100, the root zone). Both are in %
+  of saturation, on 1 km cells: area means, points, grid cells and the source comparison work as for the other
+  sources. They complement SIM2's soil wetness index (8 km, a model) and ERA5-Land's soil moisture (a model).
+- **Dry matter productivity** (step `clms-dmp`, checked every 2 days): on the Vegetation tab, *Dry matter productivity* gives for the selected area the growth every 10
+  days (kg of dry matter per hectare and day) of a year against the other years (mean, lowest, highest), and the
+  dry matter produced since 1 January (t/ha). It covers all the vegetation of the 300 m cells: a tool to compare
+  years and areas (a drought, a late spring), not a yield.
+- **Phenology per parcel** (step `clms-vpp`, monthly; a year is published the following year): the HR-VPP
+  season of each RPG parcel (and of the farm's fields in the years of its land cover), the median of its
+  interior pixels: start, peak and end dates, length, peak and amplitude of the Plant Phenology Index,
+  productivity. The Vegetation tab's parcel view marks the start, peak and end on the parcel's curve and gives
+  the figures below it. The dates need a workaround: the files hold them as YYDOY (23095 is day 95 of 2023),
+  but the openEO back-end casts them to the 8 bits its catalogue declares, so they arrive modulo 256. They are
+  recovered from the season length (intact) and the peak (in the product's year): about 83 % of pixels have a
+  single solution, the others are left out, and a parcel's dates need 30 % of its pixels decoded.
+
+**Per field.** In the Vegetation tab's parcel view, *Soil moisture and productivity* gives the parcel's soil
+moisture over its season (the surface from Sentinel-1 as dots, the Soil Water Index at its five depths as lines,
+and the mean of the other years for a variable chosen), its dry matter productivity every 10 days against the other
+years (mean, lowest, highest) and the dry matter produced since 1 September, and a table: the season's mean, the
+mean of the same period in the other years (to the same date) and the difference, the lowest and highest values
+and their dates. The link below it downloads the same statistics for every parcel of the season (RPG parcels and
+the farm's fields) as CSV. The cells are larger than most parcels (1 km for soil moisture, 300 m for productivity):
+a parcel's value is the mean of the cells it overlaps, weighted by its area in each (cells without a value, the
+sea, are left out while the others cover half of the parcel). Computed on request from the stores, nothing is kept
+per parcel: they describe the soil water and growth around the parcel, to compare seasons and distant parcels.
+
+Not used: Terrascope's ready-made Sentinel-2 NDVI (the bands are read instead: NDRE and NDWI need B05 and B03 added to `GEOMON_S2_BANDS`), its LAI
+(not produced over France), CropSAR-2D (Belgium and the Netherlands only), the VLCC crop and grassland layers
+and the 10-daily Plant Phenology Index (no data returned over the sites when tested).
 
 ### MODIS NDVI
 
@@ -423,7 +501,7 @@ docker compose run --rm ingest modis-crops    # recompute the crop-group curves 
   areas have few or no pure cells: around Dragey, about 100 pure cells of permanent grassland, 50 of
   maize and 10 to 20 of wheat over the whole group with parcels (25 to 60 with the coarser îlots), but
   only one or two per group on the farm's plots. Recomputing all seasons takes about 2 minutes for
-  Dragey. Run `ingest modis-crops` after loading RPG years.
+  Dragey. Run `ingest modis-crops` after reloading the RPG (`ingest rpg`; a new year is handled by `rpg-new`).
 
 ### Soils
 
@@ -537,15 +615,15 @@ in any projection and datum (Lambert-93, NTF Lambert II, UTM, ED50...): it is re
 GDAL/PROJ (`geomon/vector.py`). Crop codes outside the RPG nomenclature are reported in the log.
 
 The farm's fields have their own Sentinel-2 series: their outlines, shrunk by 10 m like the RPG parcels,
-are a parcel layer of their own (`rpg_year` 0 in `eo.parcel_stats`, `parcel_season`, `parcel_info`; one
+are a parcel layer of their own (`rpg_year` 0: the store `farm.zarr`, `eo.parcel_season`, `parcel_info`; one
 series per outline, shared by the years whose files repeat it). In each year with a land-cover file, the
 farm's fields replace the RPG parcels lying in them (their centre in a field), with the farm's crops
 (`eo.farm_crop`, status "your land cover"), in every area: the communes and the group as well as the
 farm's own. The farm's own area ("My plots") only has crop-group curves (Sentinel-2 and MODIS) for those
 years, from its fields: in the other years the RPG says nothing reliable about the farm's plots. The
 parcel view shows the field at the clicked point (its own outline, crop and curve; the RPG's crop when
-different) in those years, and the RPG parcel before. Fields with fewer than 4 interior pixels (about
-0.1 ha once shrunk) have no series.
+different) in those years, and the RPG parcel before. A field too small once shrunk is followed on its
+whole outline; below 4 pixels' area (400 m²) it has no curve.
 
 ```bash
 docker compose run --rm ingest farm      # after changing a file; when the land cover changed, recomputes the
@@ -673,10 +751,13 @@ Every tab follows it; the selected area is outlined in red on the map.
 | `GET /api/s2/{index}.png?date=&masked=true`, `…/info` | Index image of a date and its legend |
 | `GET /api/s2/crops?index=ndvi&area=&season=` | Seasons with parcel curves, crop groups of an area in a season |
 | `GET /api/s2/crop?group=1&season=2025&index=ndvi&area=` | Crop group curve, observations, 3-year / 5-year / long-term references |
-| `GET /api/s2/parcel?lon=&lat=&season=&index=ndvi` | Parcel at a point: crop history, curve and observations of a season |
+| `GET /api/s2/parcel?lon=&lat=&season=&index=ndvi` | Parcel at a point: crop history, curve and observations of a season, and its Copernicus HR-VPP season (`vpp`) |
 | `GET /api/s1/info` | Sentinel-1 stores: dates and relative orbits per direction, measures |
 | `GET /api/s1/series?measure=vv&direction=asc&area=` | Backscatter statistics per acquisition over an area, with its relative orbit |
 | `GET /api/s1/{vv,vh,vh_vv,rvi}.png?date=&direction=`, `…/info` | Image of a date and its legend |
+| `GET /api/clms/parcel?season=&rpg_year=&parcel_id=&start=&end=` | Soil moisture and dry matter productivity of a parcel (`rpg_year` 0: the farm's field) over its season or a period: series, other years, statistics |
+| `GET /api/clms/parcels.csv?season=&start=&end=` | The same statistics for every parcel of a season, as CSV |
+| `GET /api/clms/dmp?area=&year=` | Dry matter productivity of an area every 10 days, against the other years, and accumulated since 1 January |
 | `GET /api/modis/info` | MODIS NDVI stores: years, composites per platform |
 | `GET /api/modis/series?area=&min_clear=0.9` | NDVI statistics per composite over an area (reliable cells), with its platform |
 | `GET /api/modis/ndvi.png?date=&masked=true`, `…/info` | NDVI image of a composite and its legend |

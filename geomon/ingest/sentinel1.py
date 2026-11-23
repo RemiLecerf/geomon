@@ -165,7 +165,7 @@ def _update(conn, part: Part, direction: str, year: int) -> dict:
             new = _with_orbits(new, part, direction, start, y_end)
             out["dates"] = list(new["time"].values)
             if new["time"].values.min() > ds["time"].values.max():
-                new.attrs = {}
+                new.attrs = dict(ds.attrs)       # an append writes the store's attributes: keep them
                 ing2._per_date(new).to_zarr(path, append_dim="time", consolidated=True)
             else:                               # a late acquisition between stored dates: rewrite the year
                 merged = xr.concat([ds, new], dim="time").sortby("time")

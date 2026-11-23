@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from .. import parcels
+from .. import fields, parcels
 from .. import sentinel2 as s2
 from ..aoi import AOI, site_areas
 from ..config import settings
@@ -138,7 +138,13 @@ def download(cube, dest: Path, label: str, batch: bool, title: str) -> bool:
         else:
             cube.download(str(dest), format="netCDF")
     except Exception as exc:
-        if "NoDataAvailable" in str(exc) or "no data" in str(exc).lower():
+        text = str(exc)
+        if getattr(exc, "job", None) is not None:        # a failed batch job: the reason is in its logs
+            try:
+                text += " ".join(str(e.get("message")) for e in exc.job.logs(level="error"))
+            except Exception:
+                pass
+        if "NoDataAvailable" in text or "no data" in text.lower():
             log.info("  %s: no scene", label)
             return False
         raise
@@ -240,6 +246,7 @@ def _remove_download(nc: Path) -> None:
     """A download, and the runs and clear-date pass of a two-pass request (``<name>_*.nc``)."""
     for f in [nc, *nc.parent.glob(f"{nc.stem}_*.nc")]:
         f.unlink(missing_ok=True)
+        _complete_marker(f).unlink(missing_ok=True)
         _complete_marker(f).unlink(missing_ok=True)
 
 
@@ -578,7 +585,7 @@ def _update(conn, aoi: Part, year: int) -> dict:
         if new.sizes["time"]:
             added = list(new["time"].values)
             if new["time"].values.min() > ds["time"].values.max():
-                new.attrs = {}
+                new.attrs = dict(ds.attrs)       # an append writes the store's attributes: keep them
                 _per_date(new).to_zarr(path, append_dim="time", consolidated=True)
             else:   # a late scene falls between stored dates: rewrite the year
                 merged = xr.concat([ds, new], dim="time").sortby("time")   # lazy: written to a temporary store first
@@ -652,16 +659,16 @@ def reencode_stores(paths, min_clear: float | None) -> dict:
 
 def reencode(aoi: AOI) -> dict:
     """Step ``sentinel2-reencode``: the stored images rewritten with the current encoding, without
-    the dates below GEOMON_S2_MIN_CLEAR (no download); their statistics removed (eo.parcel_stats,
-    eo.parcel_dates, eo.index_stats) and the curves recomputed."""
+    the dates below GEOMON_S2_MIN_CLEAR (no download); their statistics removed (the parcel stores of
+    geomon.fields, eo.index_stats) and the curves recomputed."""
     paths = sorted(s2.site_dir(aoi.code).glob("**/*.zarr")) if s2.site_dir(aoi.code).exists() else []
     r = reencode_stores(paths, settings.s2_min_clear)
     days = sorted({str(np.datetime64(d, "D")) for d in r["removed"]})
     if days:
+        gone = set(days)
+        for name in fields.layers(aoi.code, parcels.PRODUCT):
+            fields.keep_dates(aoi.code, parcels.PRODUCT, name, lambda d: str(d) not in gone)
         with connect() as conn:
-            conn.execute("DELETE FROM eo.parcel_stats WHERE site_id = meta.site_key_of(%s) AND date = ANY(%s::date[])",
-                         (aoi.code, days))
-            conn.execute("DELETE FROM eo.parcel_dates WHERE site = %s AND date = ANY(%s::date[])", (aoi.code, days))
             conn.execute("DELETE FROM eo.index_stats WHERE site = %s AND index = ANY(%s) AND date = ANY(%s::date[])",
                          (aoi.code, list(s2.INDICES), days))
         seasons = sorted({x for d in days for x in parcels.seasons_of(dt.date.fromisoformat(d))})
